@@ -26,8 +26,8 @@ use crate::{
     protocol::{ErrorBody, Message},
     services::{Service, ServicesRegistry},
     telemetry::{
-        ingest_otlp_json, ingest_otlp_logs, ingest_otlp_metrics, inject_baggage_from_context,
-        inject_traceparent_from_context,
+        SpanExt, ingest_otlp_json, ingest_otlp_logs, ingest_otlp_metrics,
+        inject_baggage_from_context, inject_traceparent_from_context,
     },
     trigger::{Trigger, TriggerRegistry, TriggerType},
     worker_connections::{RuntimeWorkerInfo, WorkerConnection, WorkerConnectionRegistry},
@@ -468,23 +468,26 @@ impl Engine {
         baggage: &Option<String>,
         invocation_id: Option<Uuid>,
     ) {
-        let span = {
-            // Parent context must be on `Context::current()` BEFORE span
-            // creation so `SpanProcessor::on_start` sees the baggage;
-            // `set_parent` after creation runs too late.
-            let parent_cx =
-                crate::telemetry::extract_context(traceparent.as_deref(), baggage.as_deref());
-            let _guard = parent_cx.attach();
-            tracing::info_span!(
-                "handle_invocation",
-                otel.name = %format!("handle_invocation {}", function_id),
-                worker_id = %worker.id,
-                function_id = %function_id,
-                invocation_id = %crate::logging::display_option(&invocation_id),
-                otel.kind = "server",
-                otel.status_code = tracing::field::Empty,
-            )
-        };
+        // Use `with_parent_headers` (which calls `set_parent` on the
+        // still-unentered span) instead of `OtelContext::attach()` +
+        // `info_span!()`.  The `attach`-before-`info_span!` pattern only
+        // works for contextual spans (those created inside an active tracing
+        // span) because `tracing-opentelemetry`'s `parent_context()` only
+        // reads `Context::current()` when `is_contextual() == true`.  For
+        // non-contextual spans it falls through to `Context::default()` and
+        // silently ignores the attached context, creating an orphan root
+        // trace.  `set_parent` replaces the `parent_cx` in the Builder
+        // state directly and always works before the span is entered.
+        let span = tracing::info_span!(
+            "handle_invocation",
+            otel.name = %format!("handle_invocation {}", function_id),
+            worker_id = %worker.id,
+            function_id = %function_id,
+            invocation_id = %crate::logging::display_option(&invocation_id),
+            otel.kind = "server",
+            otel.status_code = tracing::field::Empty,
+        )
+        .with_parent_headers(traceparent.as_deref(), baggage.as_deref());
 
         let engine = self.clone();
         let worker = worker.clone();
@@ -1003,22 +1006,13 @@ impl Engine {
                         let traceparent = traceparent.clone();
                         let baggage = baggage.clone();
 
-                        let span = {
-                            // Parent context must be on `Context::current()`
-                            // BEFORE span creation; `set_parent` after is too
-                            // late for `SpanProcessor::on_start`.
-                            let parent_cx = crate::telemetry::extract_context(
-                                traceparent.as_deref(),
-                                baggage.as_deref(),
-                            );
-                            let _guard = parent_cx.attach();
-                            tracing::info_span!(
-                                "enqueue_action",
-                                otel.name = %format!("enqueue {} → {}", function_id, queue),
-                                function_id = %function_id,
-                                queue = %queue,
-                            )
-                        };
+                        let span = tracing::info_span!(
+                            "enqueue_action",
+                            otel.name = %format!("enqueue {} → {}", function_id, queue),
+                            function_id = %function_id,
+                            queue = %queue,
+                        )
+                        .with_parent_headers(traceparent.as_deref(), baggage.as_deref());
 
                         tokio::spawn(
                             async move {
