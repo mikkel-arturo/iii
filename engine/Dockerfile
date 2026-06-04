@@ -1,7 +1,21 @@
-FROM gcr.io/distroless/cc-debian12:nonroot
+FROM rust:slim-bookworm AS builder
 
-ARG TARGETARCH
-COPY iii-${TARGETARCH} /app/iii
+WORKDIR /build
+COPY . .
+
+RUN cargo build --release -p iii && cp target/release/iii /build/iii
+
+FROM busybox:1.36.1-uclibc AS busybox
+
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=busybox /bin/busybox /bin/busybox
+COPY --from=builder /build/iii /app/iii
+RUN ln -s /app/iii /usr/local/bin/iii
 
 ENV III_EXECUTION_CONTEXT=docker
 ENV III_ENV=development
