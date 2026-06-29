@@ -12,7 +12,8 @@ use serde_json::{Value, json};
 use serial_test::serial;
 use tokio::sync::Mutex;
 
-use iii_sdk::{IIIError, RegisterFunction, RegisterTriggerInput};
+use iii_sdk::protocol::{RegisterTriggerInput, TriggerRequest};
+use iii_sdk::{Error, RegisterFunction};
 use tokio::time::sleep;
 
 fn test_pdf_path() -> PathBuf {
@@ -141,12 +142,12 @@ async fn raw_json_request_body() {
                     .map(|(_, r)| r.clone())
                     .expect("missing reader ref");
 
-                let writer = iii_sdk::ChannelWriter::new(iii.address(), &writer_ref);
-                let reader = iii_sdk::ChannelReader::new(iii.address(), &reader_ref);
+                let writer = iii_sdk::channel::ChannelWriter::new(iii.address(), &writer_ref);
+                let reader = iii_sdk::channel::ChannelReader::new(iii.address(), &reader_ref);
                 let raw = reader
                     .read_all()
                     .await
-                    .map_err(|e| IIIError::Handler(e.to_string()))?;
+                    .map_err(|e| Error::Handler(e.to_string()))?;
 
                 writer
                     .send_message(
@@ -156,7 +157,7 @@ async fn raw_json_request_body() {
                         .unwrap(),
                     )
                     .await
-                    .map_err(|e| IIIError::Handler(e.to_string()))?;
+                    .map_err(|e| Error::Handler(e.to_string()))?;
 
                 writer
                     .send_message(
@@ -166,23 +167,23 @@ async fn raw_json_request_body() {
                         .unwrap(),
                     )
                     .await
-                    .map_err(|e| IIIError::Handler(e.to_string()))?;
+                    .map_err(|e| Error::Handler(e.to_string()))?;
 
                 let response_body = serde_json::to_vec(&json!({
                     "parsed_body": parsed_body,
                     "raw_body": String::from_utf8(raw)
-                        .map_err(|e| IIIError::Handler(e.to_string()))?,
+                        .map_err(|e| Error::Handler(e.to_string()))?,
                 }))
-                .map_err(|e| IIIError::Handler(e.to_string()))?;
+                .map_err(|e| Error::Handler(e.to_string()))?;
 
                 writer
                     .write(&response_body)
                     .await
-                    .map_err(|e| IIIError::Handler(e.to_string()))?;
+                    .map_err(|e| Error::Handler(e.to_string()))?;
                 writer
                     .close()
                     .await
-                    .map_err(|e| IIIError::Handler(e.to_string()))?;
+                    .map_err(|e| Error::Handler(e.to_string()))?;
 
                 Ok(Value::Null)
             }
@@ -427,7 +428,7 @@ async fn download_pdf_streaming() {
                     .map(|(_, r)| r.clone())
                     .expect("missing writer ref");
 
-                let writer = iii_sdk::ChannelWriter::new(iii.address(), &writer_ref);
+                let writer = iii_sdk::channel::ChannelWriter::new(iii.address(), &writer_ref);
 
                 writer
                     .send_message(
@@ -437,7 +438,7 @@ async fn download_pdf_streaming() {
                         .unwrap(),
                     )
                     .await
-                    .map_err(|e| IIIError::Handler(e.to_string()))?;
+                    .map_err(|e| Error::Handler(e.to_string()))?;
 
                 writer
                     .send_message(
@@ -447,16 +448,16 @@ async fn download_pdf_streaming() {
                         .unwrap(),
                     )
                     .await
-                    .map_err(|e| IIIError::Handler(e.to_string()))?;
+                    .map_err(|e| Error::Handler(e.to_string()))?;
 
                 writer
                     .write(&pdf_data)
                     .await
-                    .map_err(|e| IIIError::Handler(e.to_string()))?;
+                    .map_err(|e| Error::Handler(e.to_string()))?;
                 writer
                     .close()
                     .await
-                    .map_err(|e| IIIError::Handler(e.to_string()))?;
+                    .map_err(|e| Error::Handler(e.to_string()))?;
 
                 Ok(Value::Null)
             }
@@ -541,8 +542,8 @@ async fn upload_pdf_streaming() {
                     .map(|(_, r)| r.clone())
                     .expect("missing reader ref");
 
-                let writer = iii_sdk::ChannelWriter::new(iii.address(), &writer_ref);
-                let reader = iii_sdk::ChannelReader::new(iii.address(), &reader_ref);
+                let writer = iii_sdk::channel::ChannelWriter::new(iii.address(), &writer_ref);
+                let reader = iii_sdk::channel::ChannelReader::new(iii.address(), &reader_ref);
 
                 writer
                     .send_message(
@@ -552,7 +553,7 @@ async fn upload_pdf_streaming() {
                         .unwrap(),
                     )
                     .await
-                    .map_err(|e| IIIError::Handler(e.to_string()))?;
+                    .map_err(|e| Error::Handler(e.to_string()))?;
 
                 writer
                     .send_message(
@@ -562,25 +563,25 @@ async fn upload_pdf_streaming() {
                         .unwrap(),
                     )
                     .await
-                    .map_err(|e| IIIError::Handler(e.to_string()))?;
+                    .map_err(|e| Error::Handler(e.to_string()))?;
 
                 let data = reader
                     .read_all()
                     .await
-                    .map_err(|e| IIIError::Handler(e.to_string()))?;
+                    .map_err(|e| Error::Handler(e.to_string()))?;
                 let len = data.len();
                 *received.lock().await = data;
 
                 let body = serde_json::to_vec(&json!({"received_size": len}))
-                    .map_err(|e| IIIError::Handler(e.to_string()))?;
+                    .map_err(|e| Error::Handler(e.to_string()))?;
                 writer
                     .write(&body)
                     .await
-                    .map_err(|e| IIIError::Handler(e.to_string()))?;
+                    .map_err(|e| Error::Handler(e.to_string()))?;
                 writer
                     .close()
                     .await
-                    .map_err(|e| IIIError::Handler(e.to_string()))?;
+                    .map_err(|e| Error::Handler(e.to_string()))?;
 
                 Ok(Value::Null)
             }
@@ -646,7 +647,7 @@ async fn sse_streaming() {
                     .map(|(_, r)| r.clone())
                     .expect("missing writer ref");
 
-                let writer = iii_sdk::ChannelWriter::new(iii.address(), &writer_ref);
+                let writer = iii_sdk::channel::ChannelWriter::new(iii.address(), &writer_ref);
 
                 writer
                     .send_message(
@@ -656,7 +657,7 @@ async fn sse_streaming() {
                         .unwrap(),
                     )
                     .await
-                    .map_err(|e| IIIError::Handler(e.to_string()))?;
+                    .map_err(|e| Error::Handler(e.to_string()))?;
 
                 writer
                     .send_message(
@@ -670,7 +671,7 @@ async fn sse_streaming() {
                         .unwrap(),
                     )
                     .await
-                    .map_err(|e| IIIError::Handler(e.to_string()))?;
+                    .map_err(|e| Error::Handler(e.to_string()))?;
 
                 for event in &events {
                     let mut frame = String::new();
@@ -684,14 +685,14 @@ async fn sse_streaming() {
                     writer
                         .write(frame.as_bytes())
                         .await
-                        .map_err(|e| IIIError::Handler(e.to_string()))?;
+                        .map_err(|e| Error::Handler(e.to_string()))?;
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
 
                 writer
                     .close()
                     .await
-                    .map_err(|e| IIIError::Handler(e.to_string()))?;
+                    .map_err(|e| Error::Handler(e.to_string()))?;
                 Ok(Value::Null)
             }
         }),
@@ -786,13 +787,13 @@ async fn urlencoded_form_data() {
                     .map(|(_, r)| r.clone())
                     .expect("missing reader ref");
 
-                let writer = iii_sdk::ChannelWriter::new(iii.address(), &writer_ref);
-                let reader = iii_sdk::ChannelReader::new(iii.address(), &reader_ref);
+                let writer = iii_sdk::channel::ChannelWriter::new(iii.address(), &writer_ref);
+                let reader = iii_sdk::channel::ChannelReader::new(iii.address(), &reader_ref);
 
                 let raw = reader
                     .read_all()
                     .await
-                    .map_err(|e| IIIError::Handler(e.to_string()))?;
+                    .map_err(|e| Error::Handler(e.to_string()))?;
                 let body = String::from_utf8_lossy(&raw);
 
                 let params: std::collections::HashMap<String, String> = body
@@ -815,7 +816,7 @@ async fn urlencoded_form_data() {
                         .unwrap(),
                     )
                     .await
-                    .map_err(|e| IIIError::Handler(e.to_string()))?;
+                    .map_err(|e| Error::Handler(e.to_string()))?;
 
                 writer
                     .send_message(
@@ -825,23 +826,23 @@ async fn urlencoded_form_data() {
                         .unwrap(),
                     )
                     .await
-                    .map_err(|e| IIIError::Handler(e.to_string()))?;
+                    .map_err(|e| Error::Handler(e.to_string()))?;
 
                 let result = serde_json::to_vec(&json!({
                     "name": params.get("name"),
                     "email": params.get("email"),
                     "age": params.get("age"),
                 }))
-                .map_err(|e| IIIError::Handler(e.to_string()))?;
+                .map_err(|e| Error::Handler(e.to_string()))?;
 
                 writer
                     .write(&result)
                     .await
-                    .map_err(|e| IIIError::Handler(e.to_string()))?;
+                    .map_err(|e| Error::Handler(e.to_string()))?;
                 writer
                     .close()
                     .await
-                    .map_err(|e| IIIError::Handler(e.to_string()))?;
+                    .map_err(|e| Error::Handler(e.to_string()))?;
 
                 Ok(Value::Null)
             }
@@ -937,13 +938,13 @@ async fn multipart_form_data() {
                     .map(|(_, r)| r.clone())
                     .expect("missing reader ref");
 
-                let writer = iii_sdk::ChannelWriter::new(iii.address(), &writer_ref);
-                let reader = iii_sdk::ChannelReader::new(iii.address(), &reader_ref);
+                let writer = iii_sdk::channel::ChannelWriter::new(iii.address(), &writer_ref);
+                let reader = iii_sdk::channel::ChannelReader::new(iii.address(), &reader_ref);
 
                 let raw = reader
                     .read_all()
                     .await
-                    .map_err(|e| IIIError::Handler(e.to_string()))?;
+                    .map_err(|e| Error::Handler(e.to_string()))?;
 
                 let content_type = input
                     .get("headers")
@@ -968,7 +969,7 @@ async fn multipart_form_data() {
                         .unwrap(),
                     )
                     .await
-                    .map_err(|e| IIIError::Handler(e.to_string()))?;
+                    .map_err(|e| Error::Handler(e.to_string()))?;
 
                 writer
                     .send_message(
@@ -978,7 +979,7 @@ async fn multipart_form_data() {
                         .unwrap(),
                     )
                     .await
-                    .map_err(|e| IIIError::Handler(e.to_string()))?;
+                    .map_err(|e| Error::Handler(e.to_string()))?;
 
                 let result = serde_json::to_vec(&json!({
                     "has_boundary": has_boundary,
@@ -987,16 +988,16 @@ async fn multipart_form_data() {
                     "has_filename": has_filename,
                     "body_size": raw.len(),
                 }))
-                .map_err(|e| IIIError::Handler(e.to_string()))?;
+                .map_err(|e| Error::Handler(e.to_string()))?;
 
                 writer
                     .write(&result)
                     .await
-                    .map_err(|e| IIIError::Handler(e.to_string()))?;
+                    .map_err(|e| Error::Handler(e.to_string()))?;
                 writer
                     .close()
                     .await
-                    .map_err(|e| IIIError::Handler(e.to_string()))?;
+                    .map_err(|e| Error::Handler(e.to_string()))?;
 
                 Ok(Value::Null)
             }
@@ -1046,4 +1047,88 @@ async fn multipart_form_data() {
     assert!(data["has_description"].as_bool().unwrap_or(false));
     assert!(data["has_filename"].as_bool().unwrap_or(false));
     assert!(data["body_size"].as_u64().unwrap_or(0) > original_pdf.len() as u64);
+}
+
+#[tokio::test]
+#[serial]
+async fn conflicting_route_structure_is_rejected() {
+    let iii = common::shared_iii();
+
+    // First route registers normally.
+    iii.register_function(
+        "test::api::conflict::a::rs",
+        RegisterFunction::new_async(|_input: Value| async move {
+            Ok(json!({"status_code": 200, "body": {"ok": true}}))
+        }),
+    );
+    iii.register_trigger(RegisterTriggerInput {
+        trigger_type: "http".to_string(),
+        function_id: "test::api::conflict::a::rs".to_string(),
+        config: json!({
+            "api_path": "test/rs/conflict/:listId/:userId",
+            "http_method": "GET",
+        }),
+        metadata: None,
+    })
+    .expect("register trigger a");
+
+    // Second route has the same axum shape with swapped param names -> conflict.
+    iii.register_function(
+        "test::api::conflict::b::rs",
+        RegisterFunction::new_async(|_input: Value| async move {
+            Ok(json!({"status_code": 200, "body": {"ok": true}}))
+        }),
+    );
+    iii.register_trigger(RegisterTriggerInput {
+        trigger_type: "http".to_string(),
+        function_id: "test::api::conflict::b::rs".to_string(),
+        config: json!({
+            "api_path": "test/rs/conflict/:userId/:listId",
+            "http_method": "GET",
+        }),
+        metadata: None,
+    })
+    .expect("register trigger b");
+
+    common::settle().await;
+    sleep(Duration::from_millis(500)).await;
+
+    // Engine stayed alive and the first route still serves — no panic.
+    let resp = common::http_client()
+        .get(format!(
+            "{}/test/rs/conflict/list1/user1",
+            common::engine_http_url()
+        ))
+        .send()
+        .await
+        .expect("request failed");
+    assert_eq!(resp.status().as_u16(), 200);
+    let data: Value = resp.json().await.expect("json parse");
+    assert_eq!(data["ok"], true);
+
+    // Exactly one of the two routes survives: the engine rejects whichever conflicting
+    // registration it processes second (the order over the wire is not guaranteed), so
+    // the loser never becomes an active registered trigger.
+    let mut registered = 0;
+    for function_id in ["test::api::conflict::a::rs", "test::api::conflict::b::rs"] {
+        let listed = iii
+            .trigger(TriggerRequest {
+                function_id: "engine::registered-triggers::list".to_string(),
+                payload: json!({ "function_id": function_id }),
+                action: None,
+                timeout_ms: None,
+            })
+            .await
+            .expect("registered-triggers::list request should succeed");
+        let rows = listed
+            .get("registered_triggers")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        registered += rows;
+    }
+    assert_eq!(
+        registered, 1,
+        "exactly one conflicting route must be registered, found {registered}"
+    );
 }

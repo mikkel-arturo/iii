@@ -9,11 +9,12 @@ STOP_SCRIPT         := bash scripts/stop-iii.sh
 III_URL             := ws://localhost:49199
 III_HTTP_URL        := http://localhost:3199
 PYTHON_SDK_DIR      := sdk/packages/python/iii
+LOCAL_BIN           := $(HOME)/.local/bin
 
 export III_TELEMETRY_ENABLED := false
 
 .PHONY: install install-node install-python install-hooks \
-        engine-build engine-test engine-fmt-check \
+        engine-build engine-test coverage install-iii-worker engine-fmt-check \
         engine-up engine-up-bridges engine-down \
         init-build-x86 init-build-aarch64 init-build-all \
         sandbox sandbox-debug \
@@ -24,7 +25,7 @@ export III_TELEMETRY_ENABLED := false
         build-node build-sdk-node build-console build \
         fix fix-lint fix-fmt \
         check ci-engine ci-sdk-node ci-sdk-python ci-sdk-rust \
-        ci-console ci-local
+        ci-console ci-local cli-docs
 
 # ── Setup ─────────────────────────────────────────────────────────────────────
 
@@ -46,8 +47,24 @@ install-hooks:
 engine-build:
 	cargo build -p iii --all-features
 
-engine-test:
+# Build iii-worker and put it on PATH — the iii integration tests shell out to it.
+install-iii-worker:
+	cargo build -p iii-worker
+	mkdir -p $(LOCAL_BIN)
+	install -m755 target/debug/iii-worker $(LOCAL_BIN)/iii-worker
+
+# Mirrors the CI test set (Engine Coverage job). VM crates use default features
+# (--all-features would pull in the KVM-only integration-vm/-oci suites); iii
+# runs with --all-features. cargo test includes doctests.
+engine-test: install-iii-worker
+	cargo test -p iii-worker -p iii-filesystem -p iii-network -p iii-init
 	cargo test -p iii --all-features
+
+coverage: install-iii-worker ## Run the engine test suite under llvm-cov (same as CI), prints a report
+	@eval "$$(cargo llvm-cov show-env --export-prefix)" && \
+		cargo test -p iii-worker -p iii-filesystem -p iii-network -p iii-init && \
+		cargo test -p iii --all-features && \
+		cargo llvm-cov report
 
 engine-fmt-check:
 	cargo fmt --all -- --check
@@ -171,7 +188,15 @@ build-console:
 	pnpm --filter console-frontend build
 	cargo build -p iii-console --release
 
-build: build-sdk-node build-console
+build: sandbox build-console ## Build everything: init + engine + worker + console
+	@echo ""
+	@echo "Build complete. Binaries:"
+	@echo "  engine:   $(CURDIR)/target/release/iii"
+	@echo "  console:  $(CURDIR)/target/release/iii-console"
+	@echo "  worker:   $(CURDIR)/target/$(WORKER_TARGET)/release/iii-worker"
+	@echo ""
+	@echo "Add them to your PATH:"
+	@echo '  export PATH="$(CURDIR)/target/release:$(CURDIR)/target/$(WORKER_TARGET)/release:$$PATH"'
 
 # ── CI Jobs (mirror ci.yml) ──────────────────────────────────────────────────
 
@@ -194,6 +219,9 @@ ci-console:
 
 # ── Convenience ───────────────────────────────────────────────────────────────
 
+cli-docs: ## Regenerate docs/next/cli-reference/ from the clap CLI definitions
+	./scripts/generate-cli-docs.sh
+
 fix: fix-fmt fix-lint
 
 fix-fmt:
@@ -204,6 +232,6 @@ fix-lint:
 	cargo clippy -p iii-sdk --all-targets --all-features --fix --allow-dirty --allow-staged -- -D warnings
 	pnpm --filter console-frontend run lint:fix
 
-check: lint fmt-check-all typecheck build
+check: lint fmt-check-all typecheck build-sdk-node build-console
 
 ci-local: ci-engine ci-sdk-node ci-sdk-python ci-sdk-rust ci-console

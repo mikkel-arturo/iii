@@ -32,7 +32,7 @@ struct Args {
     #[arg(long, default_value = "3112")]
     ws_port: u16,
 
-    /// Port for the iii engine bridge WebSocket
+    /// Engine WebSocket port the console registers its worker functions on
     #[arg(long, default_value = "49134")]
     bridge_port: u16,
 
@@ -47,6 +47,48 @@ struct Args {
     /// Enable the experimental flow visualization page
     #[arg(long, env = "III_ENABLE_FLOW")]
     enable_flow: bool,
+
+    #[command(subcommand)]
+    command: Option<ConsoleCommand>,
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum ConsoleCommand {
+    /// Generate the committed MDX CLI reference page from this binary's
+    /// clap definitions (build tooling; see scripts/generate-cli-docs.sh)
+    #[command(name = "gen-cli-docs", hide = true)]
+    GenDocs {
+        /// Write the page to this file instead of stdout
+        #[arg(long, value_name = "FILE")]
+        out: Option<std::path::PathBuf>,
+    },
+}
+
+/// Render this binary's clap tree as a page fragment that
+/// scripts/generate-cli-docs.sh concatenates into the combined CLI
+/// reference (docs/next/cli-reference/index.mdx). CI regenerates the page
+/// and fails on diff, so the published reference can never drift from the
+/// CLI.
+fn gen_docs(out: Option<&std::path::Path>) -> Result<()> {
+    use clap::CommandFactory;
+    // Users reach this binary as `iii console`; document that path rather
+    // than the package name.
+    let cmd = Args::command().bin_name("iii console");
+    let meta = iii_clap_docs::PageMeta {
+        title: "iii console CLI reference".to_string(),
+        description: "Every flag and option of iii console, generated from the CLI \
+                      definitions in the console source."
+            .to_string(),
+        owner: "devrel".to_string(),
+        intro: "The `iii` binary dispatches `iii console ...` to the separately installed \
+                `iii-console` binary (downloaded on first use); the same binary can also be \
+                invoked directly as `iii-console`."
+            .to_string(),
+        delegated: std::collections::BTreeMap::new(),
+        mdx_only_notes: std::collections::BTreeMap::new(),
+    };
+    iii_clap_docs::write_fragment(cmd, &meta, out)?;
+    Ok(())
 }
 
 async fn shutdown_signal() {
@@ -84,6 +126,12 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
+    // Offline build tooling: render the docs page and exit before any
+    // server or engine-bridge setup.
+    if let Some(ConsoleCommand::GenDocs { out }) = &args.command {
+        return gen_docs(out.as_deref());
+    }
+
     info!("Starting iii-console on {}:{}", args.host, args.port);
     info!(
         "Connecting to engine at {}:{} (WS: {})",
@@ -97,7 +145,7 @@ async fn main() -> Result<()> {
             "OpenTelemetry enabled (service: {})",
             args.otel_service_name
         );
-        Some(iii_observability::OtelConfig {
+        Some(iii_helpers::observability::OtelConfig {
             enabled: Some(true),
             service_name: Some(args.otel_service_name),
             service_version: Some(env!("CARGO_PKG_VERSION").to_string()),
@@ -112,9 +160,12 @@ async fn main() -> Result<()> {
     let bridge = iii_sdk::register_worker(
         &bridge_url,
         iii_sdk::InitOptions {
-            metadata: Some(iii_sdk::WorkerMetadata {
+            metadata: Some(iii_sdk::runtime::WorkerMetadata {
                 name: "iii-console".to_string(),
-                ..iii_sdk::WorkerMetadata::default()
+                description: Some(
+                    "Web console UI and observability dashboard for the iii engine.".to_string(),
+                ),
+                ..iii_sdk::runtime::WorkerMetadata::default()
             }),
             otel: otel_config,
             headers: None,

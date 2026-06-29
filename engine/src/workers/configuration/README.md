@@ -4,6 +4,22 @@ Schema-validated, reactive registry of named configuration entries. Workers regi
 
 The default `fs` adapter stores one YAML file per id under a configurable directory and watches it for external edits — manual edits surface as `configuration:updated` events the same way SDK calls do. The `bridge` adapter delegates to a remote III Engine and re-broadcasts its events into the local fan-out. Reads expand `${VAR:default}` placeholders against the live process env on every call, so env changes propagate without a worker restart.
 
+## Install
+
+```bash
+iii worker add configuration
+```
+
+Resolves from the worker registry at [workers.iii.dev](https://workers.iii.dev/).
+
+## Skills
+
+Install the `configuration` agent skill for Claude Code, Cursor, and 30+ other agents:
+
+```bash
+npx skills add iii-hq/iii --full-depth --skill configuration
+```
+
 ## Sample Configuration
 
 ```yaml
@@ -104,6 +120,7 @@ Returns: `id` (string), `name` (string), `description` (string), `schema` (objec
 | `NOT_REGISTERED` | `set` was called against an id that has not been passed to `register` yet. |
 | `INVALID_ID` | The id does not match `[a-z0-9_-]{1,64}` — the constraint applied so ids are safe filenames for the `fs` adapter. |
 | `SCHEMA_INVALID` | The supplied value does not satisfy the registered JSON Schema. The error message lists each violation. |
+| `SCHEMA_UNAVAILABLE` | `set` was called for an id whose schema is not yet known — the owning worker has not registered it this session. The `fs` adapter does not persist the schema, so it is absent until a worker re-registers after boot. |
 | `NOT_FOUND` | `get` or `schema` was called against an id that is not registered. |
 | `ADAPTER_ERROR` | The adapter failed to persist the change (disk error, bridge unreachable, etc.). |
 

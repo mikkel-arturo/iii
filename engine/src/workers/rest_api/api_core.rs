@@ -6,7 +6,7 @@
 
 use std::{
     pin::Pin,
-    sync::{Arc, Mutex as StdMutex},
+    sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock},
 };
 
 use anyhow::anyhow;
@@ -43,6 +43,8 @@ pub struct PathRouter {
     pub function_id: String,
     pub condition_function_id: Option<String>,
     pub middleware_function_ids: Vec<String>,
+    pub trigger_id: String,
+    pub worker_id: Option<uuid::Uuid>,
 }
 
 impl PathRouter {
@@ -59,7 +61,16 @@ impl PathRouter {
             function_id,
             condition_function_id,
             middleware_function_ids,
+            trigger_id: String::new(),
+            worker_id: None,
         }
+    }
+
+    /// Set the trigger/worker that owns this route.
+    pub fn with_owner(mut self, trigger_id: String, worker_id: Option<uuid::Uuid>) -> Self {
+        self.trigger_id = trigger_id;
+        self.worker_id = worker_id;
+        self
     }
 }
 
@@ -73,10 +84,22 @@ pub struct RouterMatch {
 #[derive(Clone)]
 pub struct HttpWorker {
     engine: Arc<Engine>,
-    pub config: RestApiConfig,
+    /// Live config snapshot. The outer lock is held only for pointer swaps;
+    /// readers clone the inner `Arc` once per request/function via
+    /// `config_snapshot()`, which is what makes the value hot-swappable from
+    /// the configuration worker without touching the request hot path.
+    config: Arc<StdRwLock<Arc<RestApiConfig>>>,
+    /// The config.yaml block passed to `create()`, if any. Used only as the
+    /// seed for first-time `configuration::register`; the configuration
+    /// worker entry is the runtime source of truth afterwards.
+    seed: Option<RestApiConfig>,
     pub routers_registry: Arc<DashMap<String, PathRouter>>,
     shared_routers: Arc<RwLock<Router>>,
     server_abort: Arc<StdMutex<Option<AbortHandle>>>,
+    /// Kept so `apply_config` can respawn the server task on host/port change.
+    shutdown_rx: Arc<StdMutex<Option<tokio::sync::watch::Receiver<bool>>>>,
+    /// Serializes concurrent `apply_config` runs (rapid configuration edits).
+    apply_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[async_trait::async_trait]
@@ -85,30 +108,24 @@ impl Worker for HttpWorker {
         "HttpWorker"
     }
     async fn create(engine: Arc<Engine>, config: Option<Value>) -> anyhow::Result<Box<dyn Worker>> {
-        let config: RestApiConfig = config
-            .map(serde_json::from_value)
-            .transpose()?
-            .unwrap_or_default();
-
-        let routers_registry = Arc::new(DashMap::new());
-
-        // Create an empty router initially, it will be updated when routes are registered
-        let empty_router = Router::new();
-        let shared_routers = Arc::new(RwLock::new(empty_router));
-
-        Ok(Box::new(Self {
-            engine,
-            config,
-            routers_registry,
-            shared_routers,
-            server_abort: Arc::new(StdMutex::new(None)),
-        }))
+        Ok(Box::new(Self::from_config(engine, config)?))
     }
 
-    fn register_functions(&self, _engine: Arc<Engine>) {}
+    fn register_functions(&self, engine: Arc<Engine>) {
+        // Registered here so the worker scope tracks the handler and removes it
+        // automatically on destroy/reload. The hook order differs by pipeline:
+        // initial boot runs `register_functions` BEFORE `start_background_tasks`
+        // (workers/config.rs), reload runs it AFTER (reload.rs) — so
+        // `start_background_tasks` also registers the handler (if absent)
+        // before subscribing to configuration events.
+        self.register_config_handler(&engine);
+    }
 
     async fn initialize(&self) -> anyhow::Result<()> {
-        tracing::info!("Initializing API adapter on port {}", self.config.port);
+        tracing::info!(
+            "Initializing API adapter on port {}",
+            self.config_snapshot().port
+        );
 
         self.engine
             .clone()
@@ -125,23 +142,279 @@ impl Worker for HttpWorker {
 
     async fn start_background_tasks(
         &self,
-        mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+        shutdown_rx: tokio::sync::watch::Receiver<bool>,
         _shutdown_tx: tokio::sync::watch::Sender<bool>,
     ) -> anyhow::Result<()> {
-        let addr = format!("{}:{}", self.config.host, self.config.port);
-        let listener = TcpListener::bind(&addr)
-            .await
-            .map_err(|err| crate::workers::traits::bind_address_error(&addr, err))?;
+        // Adopt the configuration worker as the runtime source of truth.
+        // `configuration::*` is callable here on both pipelines (initial boot
+        // registers all worker functions before serving; reload starts the
+        // mandatory configuration worker before optional ones). Failures
+        // degrade to the static config.yaml block so HTTP stays up. Both bus
+        // calls are time-bounded: worker startup is awaited serially by the
+        // boot and reload pipelines, so a hung `configuration::*` provider
+        // must not wedge every other worker behind this one.
+        let register = tokio::time::timeout(
+            super::configuration::CONFIG_BUS_TIMEOUT,
+            super::configuration::register_config(self.engine.as_ref(), self.seed.as_ref()),
+        )
+        .await
+        .map_err(|_| anyhow!("configuration::register timed out"))
+        .and_then(|result| result);
+        if let Err(err) = register {
+            tracing::warn!(
+                error = %err,
+                "iii-http: configuration::register failed; continuing with static config"
+            );
+        }
+        let fetched = tokio::time::timeout(
+            super::configuration::CONFIG_BUS_TIMEOUT,
+            super::configuration::fetch_config(self.engine.as_ref(), &self.config_snapshot()),
+        )
+        .await
+        .map_err(|_| anyhow!("configuration::get timed out"))
+        .and_then(|result| result);
+        match fetched {
+            Ok(config) => self.set_config(config),
+            Err(err) => tracing::warn!(
+                error = %err,
+                "iii-http: failed to read configuration; continuing with static config"
+            ),
+        }
+
+        // Bind after the fetch so a runtime-edited host/port survives restarts.
+        // If the stored address cannot be bound (e.g. a bad host/port was
+        // persisted by a runtime edit whose rebind failed), fall back to the
+        // seed address instead of failing the whole worker start — otherwise
+        // one bad configuration edit turns into an HTTP outage on the next
+        // engine restart. The fallback is GUARDED: it requires an explicit
+        // config.yaml seed (never the built-in 0.0.0.0 default), and it must
+        // not widen a loopback-restricted stored host to a non-loopback
+        // interface — an occupied local port must not be able to force the
+        // API onto every interface.
+        let config = self.config_snapshot();
+        let addr = format!("{}:{}", config.host, config.port);
+        let listener = match TcpListener::bind(&addr).await {
+            Ok(listener) => listener,
+            Err(err) => {
+                let Some(fallback) = self.seed.clone() else {
+                    return Err(crate::workers::traits::bind_address_error(&addr, err));
+                };
+                let fallback_addr = format!("{}:{}", fallback.host, fallback.port);
+                let widens_loopback =
+                    is_loopback_host(&config.host) && !is_loopback_host(&fallback.host);
+                if fallback_addr == addr || widens_loopback {
+                    if widens_loopback {
+                        tracing::error!(
+                            stored = %addr,
+                            seed = %fallback_addr,
+                            "iii-http: refusing seed fallback that would widen a \
+                             loopback-only address to a non-loopback interface"
+                        );
+                    }
+                    return Err(crate::workers::traits::bind_address_error(&addr, err));
+                }
+                tracing::error!(
+                    error = %err,
+                    stored = %addr,
+                    fallback = %fallback_addr,
+                    "iii-http: stored configuration address cannot be bound; serving on the \
+                     seed address — fix the stored `iii-http` configuration value"
+                );
+                self.set_config(fallback);
+                TcpListener::bind(&fallback_addr).await.map_err(|err| {
+                    crate::workers::traits::bind_address_error(&fallback_addr, err)
+                })?
+            }
+        };
+        let addr = {
+            let config = self.config_snapshot();
+            format!("{}:{}", config.host, config.port)
+        };
 
         // Build initial router from registry
         self.update_routes().await?;
 
+        let handle = self.spawn_server(listener, addr, shutdown_rx.clone());
+        *self
+            .server_abort
+            .lock()
+            .expect("server_abort mutex poisoned") = Some(handle);
+
+        // Store the receiver only once the server is live: `apply_config`
+        // refuses to rebind while this is `None`, so a stray
+        // `iii-http::on-config-change` invocation cannot spawn a server during
+        // (or instead of) the boot sequence above.
+        *self.shutdown_rx.lock().expect("shutdown_rx mutex poisoned") = Some(shutdown_rx);
+
+        // Register the handler before the trigger so a configuration event can
+        // never fan out to a missing function. On reload, `register_functions`
+        // runs after this hook and re-registers the handler inside the worker
+        // scope; the `get` check keeps the initial-boot path (where it already
+        // ran) from logging a spurious "already registered" overwrite.
+        if self
+            .engine
+            .functions
+            .get(super::configuration::CONFIG_FN_ID)
+            .is_none()
+        {
+            self.register_config_handler(&self.engine);
+        }
+        if let Err(err) = super::configuration::register_config_trigger(&self.engine).await {
+            tracing::warn!(
+                error = %err,
+                "iii-http: failed to watch configuration changes; hot-reload disabled"
+            );
+        } else {
+            // Catch-up pass: replay any `configuration::set` that landed
+            // between the boot fetch above and the trigger subscription —
+            // without it that window's updates would be dropped until the
+            // next edit. Routed through `on_config_change` so a timed-out
+            // catch-up (slow configuration backend during boot) gets the
+            // same one-shot delayed retry as a trigger-driven apply instead
+            // of leaving the boot config stale until the next edit.
+            super::configuration::on_config_change(self).await;
+        }
+
+        Ok(())
+    }
+
+    async fn destroy(&self) -> anyhow::Result<()> {
+        // Best-effort: the trigger is registered outside the worker scope, so
+        // remove it explicitly to keep ReloadManager restarts duplicate-free.
+        let _ = self
+            .engine
+            .trigger_registry
+            .unregister_trigger(
+                super::configuration::CONFIG_TRIGGER_ID.to_string(),
+                Some(super::configuration::CONFIG_TRIGGER_TYPE.to_string()),
+            )
+            .await;
+
+        // Serialize with any in-flight `apply_config` so a rebind can't spawn
+        // a replacement server after we abort below. Clearing `shutdown_rx`
+        // makes any later apply refuse the rebind path entirely.
+        let _guard = self.apply_lock.lock().await;
+        self.shutdown_rx
+            .lock()
+            .expect("shutdown_rx mutex poisoned")
+            .take();
+
+        let abort = self
+            .server_abort
+            .lock()
+            .expect("server_abort mutex poisoned")
+            .take();
+        if let Some(abort) = abort {
+            abort.abort();
+        }
+        Ok(())
+    }
+}
+
+const ALLOW_ORIGIN_ANY: &str = "*";
+
+/// True for hosts that restrict the listener to the local machine
+/// ("localhost", 127.0.0.0/8, ::1). Used by the boot bind fallback to refuse
+/// widening a loopback-only stored address to a non-loopback seed.
+fn is_loopback_host(host: &str) -> bool {
+    host == "localhost"
+        || host
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
+}
+
+impl HttpWorker {
+    fn from_config(engine: Arc<Engine>, config: Option<Value>) -> anyhow::Result<Self> {
+        let seed: Option<RestApiConfig> = config
+            .map(serde_json::from_value)
+            .transpose()?
+            .map(RestApiConfig::normalized);
+        let config = seed.clone().unwrap_or_default();
+
+        Ok(Self {
+            engine,
+            config: Arc::new(StdRwLock::new(Arc::new(config))),
+            seed,
+            routers_registry: Arc::new(DashMap::new()),
+            // Empty router initially; updated when routes are registered.
+            shared_routers: Arc::new(RwLock::new(Router::new())),
+            server_abort: Arc::new(StdMutex::new(None)),
+            shutdown_rx: Arc::new(StdMutex::new(None)),
+            apply_lock: Arc::new(tokio::sync::Mutex::new(())),
+        })
+    }
+
+    /// Construct a worker from a raw config value — mirrors
+    /// `ConfigurationWorker::for_test` so integration tests in `engine/tests/`
+    /// can drive the concrete worker without booting the full engine.
+    #[doc(hidden)]
+    pub fn for_test(engine: Arc<Engine>, config: Option<Value>) -> anyhow::Result<Self> {
+        Self::from_config(engine, config)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_tests(engine: Arc<Engine>, config: RestApiConfig) -> Self {
+        Self::from_config(
+            engine,
+            Some(serde_json::to_value(config).expect("RestApiConfig serializes")),
+        )
+        .expect("test config deserializes")
+    }
+
+    /// Register the `iii-http::on-config-change` handler. Idempotent
+    /// (replace-by-id), so it is safe to call from both `register_functions`
+    /// (which runs inside the worker scope for destroy/reload cleanup) and
+    /// `start_background_tasks` (which registers the trigger and runs first).
+    fn register_config_handler(&self, engine: &Arc<Engine>) {
+        let worker = self.clone();
+        engine.register_function_handler(
+            crate::engine::RegisterFunctionRequest {
+                function_id: super::configuration::CONFIG_FN_ID.to_string(),
+                description: Some(
+                    "Internal: re-apply the iii-http server configuration when the \
+                     authoritative configuration entry changes."
+                        .to_string(),
+                ),
+                request_format: None,
+                response_format: None,
+                metadata: Some(serde_json::json!({ "internal": true })),
+            },
+            crate::engine::Handler::new(move |_payload: Value| {
+                let worker = worker.clone();
+                async move {
+                    super::configuration::on_config_change(&worker).await;
+                    crate::function::FunctionResult::Success(Some(
+                        serde_json::json!({ "ok": true }),
+                    ))
+                }
+            }),
+        );
+    }
+
+    /// Cheap clone of the live config. Take one snapshot per request/function
+    /// so all reads within it are consistent.
+    pub fn config_snapshot(&self) -> Arc<RestApiConfig> {
+        self.config.read().expect("config lock poisoned").clone()
+    }
+
+    fn set_config(&self, config: RestApiConfig) {
+        *self.config.write().expect("config lock poisoned") = Arc::new(config);
+    }
+
+    /// Spawn the axum server task for an already-bound listener and return
+    /// its abort handle. Shared by the initial start and host/port rebinds.
+    fn spawn_server(
+        &self,
+        listener: TcpListener,
+        addr_display: String,
+        mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    ) -> AbortHandle {
         let hot_router = HotRouter {
             inner: self.shared_routers.clone(),
             engine: self.engine.clone(),
         };
         let make_service = MakeHotRouterService { router: hot_router };
-        let addr_display = addr.clone();
 
         let handle = tokio::spawn(async move {
             tracing::info!("API listening on address: {}", addr_display.purple());
@@ -157,39 +430,100 @@ impl Worker for HttpWorker {
             }
         });
 
-        *self
-            .server_abort
-            .lock()
-            .expect("server_abort mutex poisoned") = Some(handle.abort_handle());
-
-        Ok(())
+        handle.abort_handle()
     }
 
-    async fn destroy(&self) -> anyhow::Result<()> {
-        let abort = self
+    /// Re-fetch the authoritative configuration and hot-apply it. The
+    /// authoritative read happens under `apply_lock` so overlapping
+    /// configuration events can't apply a stale value last (lost update).
+    /// All-or-nothing: any failure keeps the previous config and the previous
+    /// server running.
+    ///
+    /// Same address → swap the snapshot and rebuild router layers (CORS,
+    /// timeout, concurrency); global middleware is read per-request from the
+    /// snapshot and needs no rebuild. Address change → bind the new listener
+    /// first (the addresses differ, so no self-conflict), then abort the old
+    /// server only once the new one is live. In-flight requests on the old
+    /// listener are aborted — same semantics as `destroy()`; a graceful drain
+    /// is a possible follow-up.
+    pub(super) async fn apply_config(&self) -> anyhow::Result<()> {
+        let _guard = self.apply_lock.lock().await;
+
+        // Fetch the authoritative value under the lock so concurrent
+        // configuration events can't apply an older snapshot last. A malformed
+        // stored value surfaces here and keeps the previous config and server.
+        // The fetch is a bus call (`configuration::get` can be re-registered by
+        // any connected worker), so bound it: a hung provider must not wedge
+        // every future apply behind the lock.
+        let new_config = match tokio::time::timeout(
+            super::configuration::CONFIG_BUS_TIMEOUT,
+            super::configuration::fetch_config(self.engine.as_ref(), &self.config_snapshot()),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            // Keep the `Elapsed` error downcastable: `on_config_change`
+            // schedules a one-shot retry for timeouts specifically (the stored
+            // value is valid but unapplied; without a retry the live config
+            // silently diverges until the next unrelated edit).
+            Err(elapsed) => {
+                return Err(anyhow::Error::new(elapsed)
+                    .context("configuration::get timed out; keeping previous config"));
+            }
+        };
+
+        let old = self.config_snapshot();
+        let old_addr = format!("{}:{}", old.host, old.port);
+        let new_addr = format!("{}:{}", new_config.host, new_config.port);
+
+        if old_addr == new_addr {
+            self.set_config(new_config);
+            self.update_routes().await?;
+            return Ok(());
+        }
+
+        // Resolve every fallible prerequisite before mutating the live config,
+        // so a failed rebind leaves the previous config and server untouched.
+        // The shutdown_rx check comes FIRST: it doubles as the destroyed-worker
+        // guard (destroy() clears it), and checking it before binding means a
+        // post-destroy retry can never transiently bind the stored address
+        // while a replacement worker is booting.
+        let shutdown_rx = self
+            .shutdown_rx
+            .lock()
+            .expect("shutdown_rx mutex poisoned")
+            .clone()
+            .ok_or_else(|| anyhow!("server was never started; cannot rebind"))?;
+
+        let listener = TcpListener::bind(&new_addr).await.map_err(|err| {
+            anyhow!(
+                "failed to bind {}; keeping server on {}: {}",
+                new_addr,
+                old_addr,
+                err
+            )
+        })?;
+
+        self.set_config(new_config);
+        self.update_routes().await?;
+
+        let new_handle = self.spawn_server(listener, new_addr.clone(), shutdown_rx);
+
+        let previous = self
             .server_abort
             .lock()
             .expect("server_abort mutex poisoned")
-            .take();
-        if let Some(abort) = abort {
-            abort.abort();
+            .replace(new_handle);
+        if let Some(previous) = previous {
+            previous.abort();
         }
+
+        tracing::info!(
+            old = %old_addr,
+            new = %new_addr,
+            "iii-http server rebound after configuration change"
+        );
         Ok(())
-    }
-}
-
-const ALLOW_ORIGIN_ANY: &str = "*";
-
-impl HttpWorker {
-    #[cfg(test)]
-    pub(crate) fn new_for_tests(engine: Arc<Engine>, config: RestApiConfig) -> Self {
-        Self {
-            engine,
-            config,
-            routers_registry: Arc::new(DashMap::new()),
-            shared_routers: Arc::new(RwLock::new(Router::new())),
-            server_abort: Arc::new(StdMutex::new(None)),
-        }
     }
 
     fn normalize_http_path_for_key(http_path: &str) -> String {
@@ -206,10 +540,35 @@ impl HttpWorker {
         format!("{}:{}", method, path)
     }
 
+    /// Structural signature of a route, used to detect axum matcher conflicts.
+    ///
+    /// Axum matches routes by position, not by parameter name, so
+    /// `/sessions/{listId}/{userId}` and `/sessions/{userId}/{listId}` are the
+    /// same route to its matcher and inserting both panics. Two routes share
+    /// this signature exactly when they would collide: same method and same
+    /// shape with every path parameter collapsed to a positional placeholder.
+    fn route_signature(http_method: &str, http_path: &str) -> String {
+        let axum_path = Self::build_router_for_axum(&http_path.to_string());
+        let shape = axum_path
+            .split('/')
+            .map(|segment| {
+                if segment.starts_with('{') && segment.ends_with('}') {
+                    "{}".to_string()
+                } else {
+                    segment.to_string()
+                }
+            })
+            .collect::<Vec<String>>()
+            .join("/");
+        format!("{}:{}", http_method.to_uppercase(), shape)
+    }
+
     /// Updates the router with all routes from the registry and configurations
     async fn update_routes(&self) -> anyhow::Result<()> {
+        let config = self.config_snapshot();
+
         // Build CORS layer
-        let cors_layer = self.build_cors_layer();
+        let cors_layer = Self::build_cors_layer(&config);
 
         // Read the routers_registry and build the router
         let mut new_router = Self::build_routers_from_routers_registry(
@@ -218,16 +577,18 @@ impl HttpWorker {
             &self.routers_registry,
         );
 
+        // Unmatched URLs get the same stable error envelope as every other
+        // engine-generated error (axum's default fallback is an empty body).
+        new_router = new_router.fallback(super::views::not_found_handler);
+
         new_router = new_router.layer(cors_layer);
 
         new_router = new_router.layer(TimeoutLayer::with_status_code(
             StatusCode::GATEWAY_TIMEOUT,
-            std::time::Duration::from_millis(self.config.default_timeout),
+            std::time::Duration::from_millis(config.default_timeout),
         ));
 
-        new_router = new_router.layer(ConcurrencyLimitLayer::new(
-            self.config.concurrency_request_limit,
-        ));
+        new_router = new_router.layer(ConcurrencyLimitLayer::new(config.concurrency_request_limit));
 
         let mut shared_router = self.shared_routers.write().await;
         *shared_router = new_router;
@@ -281,10 +642,25 @@ impl HttpWorker {
 
         let mut router = Router::new();
 
-        for entry in routers_registry.iter() {
-            let path = Self::build_router_for_axum(&entry.http_path);
+        // Defense in depth: `register_router` already rejects conflicting
+        // routes, but skip any colliding signature here too so a stray
+        // duplicate can never panic axum and crash the HTTP worker thread.
+        let mut seen_signatures = std::collections::HashSet::new();
 
+        for entry in routers_registry.iter() {
             let method = entry.http_method.to_ascii_uppercase();
+
+            let signature = Self::route_signature(&method, &entry.http_path);
+            if !seen_signatures.insert(signature) {
+                tracing::warn!(
+                    "Skipping route {} {} — conflicts with a previously registered route of the same structure",
+                    method.purple(),
+                    entry.http_path.purple()
+                );
+                continue;
+            }
+
+            let path = Self::build_router_for_axum(&entry.http_path);
             let path_for_extension = entry.http_path.clone();
             router = match method.as_str() {
                 "GET" => router.route(
@@ -327,8 +703,8 @@ impl HttpWorker {
             .layer(Extension(api_handler))
     }
     /// Builds the CorsLayer based on configuration
-    fn build_cors_layer(&self) -> CorsLayer {
-        let Some(cors_config) = &self.config.cors else {
+    fn build_cors_layer(config: &RestApiConfig) -> CorsLayer {
+        let Some(cors_config) = &config.cors else {
             return CorsLayer::permissive();
         };
 
@@ -387,6 +763,32 @@ impl HttpWorker {
         let http_path = router.http_path.clone();
         let method = router.http_method.to_uppercase();
         let key = Self::build_router_key(&method, &router.http_path);
+
+        // Reject routes that collide with an already-registered route of the
+        // same shape but different path-parameter names. Axum's matcher would
+        // panic on such an insert, taking down the whole HTTP worker thread, so
+        // we fail this single registration gracefully instead.
+        let signature = Self::route_signature(&method, &http_path);
+        let conflict = self
+            .routers_registry
+            .iter()
+            .find(|entry| {
+                entry.key() != &key
+                    && Self::route_signature(&entry.http_method, &entry.http_path) == signature
+            })
+            .map(|entry| entry.http_path.clone());
+        if let Some(existing_path) = conflict {
+            anyhow::bail!(
+                "Route '{} {}' conflicts with already-registered route '{} {}': \
+                 routes with identical structure but different path-parameter \
+                 names are not supported",
+                method,
+                http_path,
+                method,
+                existing_path
+            );
+        }
+
         tracing::debug!("Registering router {}", key.purple());
         self.routers_registry.insert(key, router);
 
@@ -407,14 +809,28 @@ impl HttpWorker {
         &self,
         http_method: &str,
         http_path: &str,
+        trigger_id: &str,
+        worker_id: Option<uuid::Uuid>,
     ) -> anyhow::Result<bool> {
         let key = Self::build_router_key(http_method, http_path);
         tracing::info!("Unregistering router {}", key.purple());
-        let removed = self.routers_registry.remove(&key).is_some();
+
+        let removed = self
+            .routers_registry
+            .remove_if(&key, |_, entry| {
+                entry.trigger_id == trigger_id && entry.worker_id == worker_id
+            })
+            .is_some();
 
         if removed {
             // Update routes after unregistering
             self.update_routes().await?;
+        } else if self.routers_registry.contains_key(&key) {
+            tracing::info!(
+                "Skipping unregister for {}: owner changed (trigger {} no longer owns this route)",
+                key.purple(),
+                trigger_id.purple()
+            );
         } else {
             tracing::warn!("No router found for key: {}", key.purple());
         }
@@ -466,7 +882,8 @@ impl TriggerRegistrator for HttpWorker {
                 trigger.function_id.clone(),
                 condition_function_id,
                 middleware_function_ids,
-            );
+            )
+            .with_owner(trigger.id.clone(), trigger.worker_id);
 
             adapter.register_router(router).await?;
             Ok(())
@@ -492,13 +909,20 @@ impl TriggerRegistrator for HttpWorker {
                 .and_then(|v| v.as_str())
                 .unwrap_or("GET");
 
-            adapter.unregister_router(http_method, api_path).await?;
+            adapter
+                .unregister_router(http_method, api_path, &trigger.id, trigger.worker_id)
+                .await?;
             Ok(())
         })
     }
 }
 
-crate::register_worker!("iii-http", HttpWorker, enabled_by_default = true);
+crate::register_worker!(
+    "iii-http",
+    HttpWorker,
+    description = "Expose functions as HTTP endpoints.",
+    enabled_by_default = true
+);
 
 #[cfg(test)]
 mod tests {
@@ -604,6 +1028,38 @@ mod tests {
         assert_eq!(HttpWorker::build_router_key("POST", "/"), "POST:/");
     }
 
+    // ---- route_signature tests ----
+
+    #[test]
+    fn route_signature_collapses_param_names() {
+        // Same shape, swapped param names -> identical signature (would collide).
+        let a = HttpWorker::route_signature("GET", "sessions/:listId/:userId/calls/:contactId");
+        let b = HttpWorker::route_signature("GET", "sessions/:userId/:listId/calls/:contactId");
+        assert_eq!(a, b);
+        assert_eq!(a, "GET:/sessions/{}/{}/calls/{}");
+    }
+
+    #[test]
+    fn route_signature_distinguishes_method() {
+        let get = HttpWorker::route_signature("GET", "items/:id");
+        let post = HttpWorker::route_signature("POST", "items/:id");
+        assert_ne!(get, post);
+    }
+
+    #[test]
+    fn route_signature_distinguishes_literal_segments() {
+        let a = HttpWorker::route_signature("GET", "sessions/:id/calls");
+        let b = HttpWorker::route_signature("GET", "sessions/:id/messages");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn route_signature_distinguishes_param_vs_literal() {
+        let param = HttpWorker::route_signature("GET", "users/:id");
+        let literal = HttpWorker::route_signature("GET", "users/me");
+        assert_ne!(param, literal);
+    }
+
     // ---- build_router_for_axum tests ----
 
     #[test]
@@ -658,19 +1114,24 @@ mod tests {
             cors,
             ..RestApiConfig::default()
         };
-        HttpWorker {
-            engine,
-            config,
-            routers_registry: Arc::new(DashMap::new()),
-            shared_routers: Arc::new(RwLock::new(Router::new())),
-            server_abort: Arc::new(StdMutex::new(None)),
-        }
+        HttpWorker::new_for_tests(engine, config)
+    }
+
+    #[test]
+    fn is_loopback_host_classification() {
+        assert!(is_loopback_host("localhost"));
+        assert!(is_loopback_host("127.0.0.1"));
+        assert!(is_loopback_host("127.5.4.3"));
+        assert!(is_loopback_host("::1"));
+        assert!(!is_loopback_host("0.0.0.0"));
+        assert!(!is_loopback_host("192.168.1.10"));
+        assert!(!is_loopback_host("example.com"));
     }
 
     #[test]
     fn build_cors_layer_no_config_returns_permissive() {
         let module = make_worker_with_cors(None);
-        let _cors = module.build_cors_layer();
+        let _cors = HttpWorker::build_cors_layer(&module.config_snapshot());
     }
 
     #[test]
@@ -679,7 +1140,7 @@ mod tests {
             allowed_origins: vec![],
             allowed_methods: vec![],
         }));
-        let _cors = module.build_cors_layer();
+        let _cors = HttpWorker::build_cors_layer(&module.config_snapshot());
     }
 
     #[test]
@@ -688,7 +1149,7 @@ mod tests {
             allowed_origins: vec!["*".to_string()],
             allowed_methods: vec!["GET".to_string()],
         }));
-        let _cors = module.build_cors_layer();
+        let _cors = HttpWorker::build_cors_layer(&module.config_snapshot());
     }
 
     #[test]
@@ -700,7 +1161,7 @@ mod tests {
             ],
             allowed_methods: vec!["GET".to_string(), "POST".to_string()],
         }));
-        let _cors = module.build_cors_layer();
+        let _cors = HttpWorker::build_cors_layer(&module.config_snapshot());
     }
 
     #[test]
@@ -709,7 +1170,7 @@ mod tests {
             allowed_origins: vec!["*".to_string(), "http://localhost:3000".to_string()],
             allowed_methods: vec![],
         }));
-        let _cors = module.build_cors_layer();
+        let _cors = HttpWorker::build_cors_layer(&module.config_snapshot());
     }
 
     #[test]
@@ -726,7 +1187,7 @@ mod tests {
                 "OPTIONS".to_string(),
             ],
         }));
-        let _cors = module.build_cors_layer();
+        let _cors = HttpWorker::build_cors_layer(&module.config_snapshot());
     }
 
     // ---- build_routers_from_routers_registry tests ----
@@ -1098,6 +1559,153 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unregister_stale_worker_keeps_route_owned_by_newer_worker() {
+        // Repro for #1796: rolling deploy / reconnect.
+        let module = make_worker_with_cors(None);
+
+        let worker_a = uuid::Uuid::new_v4();
+        let worker_b = uuid::Uuid::new_v4();
+
+        let trigger_a = Trigger {
+            id: "http-accounts-a".to_string(),
+            trigger_type: "http".to_string(),
+            function_id: "fn::accounts_a".to_string(),
+            config: json!({
+                "api_path": "/api/platform-accounts",
+                "http_method": "GET"
+            }),
+            worker_id: Some(worker_a),
+            metadata: None,
+        };
+
+        let trigger_b = Trigger {
+            id: "http-accounts-b".to_string(),
+            trigger_type: "http".to_string(),
+            function_id: "fn::accounts_b".to_string(),
+            config: json!({
+                "api_path": "/api/platform-accounts",
+                "http_method": "GET"
+            }),
+            worker_id: Some(worker_b),
+            metadata: None,
+        };
+
+        // 1. Worker A registers the route.
+        module
+            .register_trigger(trigger_a.clone())
+            .await
+            .expect("A registration should succeed");
+
+        // 2. Worker B re-registers the same method/path during reconnect.
+        module
+            .register_trigger(trigger_b)
+            .await
+            .expect("B registration should succeed");
+
+        // 3. Worker A's stale cleanup unregisters its trigger.
+        module
+            .unregister_trigger(trigger_a)
+            .await
+            .expect("A unregistration should succeed");
+
+        // 4. Route must still resolve to Worker B's function.
+        let router = module
+            .get_router("GET", "/api/platform-accounts")
+            .expect("route should still exist after stale unregister");
+        assert_eq!(router.function_id, "fn::accounts_b");
+    }
+
+    #[tokio::test]
+    async fn unregister_stale_worker_keeps_parameterized_route_owned_by_newer_worker() {
+        // Repro for #1796, parameterized route variant.
+        let module = make_worker_with_cors(None);
+
+        let worker_a = uuid::Uuid::new_v4();
+        let worker_b = uuid::Uuid::new_v4();
+
+        let trigger_a = Trigger {
+            id: "http-connect-a".to_string(),
+            trigger_type: "http".to_string(),
+            function_id: "fn::connect_a".to_string(),
+            config: json!({
+                "api_path": "/api/platforms/:platform/connect",
+                "http_method": "POST"
+            }),
+            worker_id: Some(worker_a),
+            metadata: None,
+        };
+
+        let trigger_b = Trigger {
+            id: "http-connect-b".to_string(),
+            trigger_type: "http".to_string(),
+            function_id: "fn::connect_b".to_string(),
+            config: json!({
+                "api_path": "/api/platforms/:platform/connect",
+                "http_method": "POST"
+            }),
+            worker_id: Some(worker_b),
+            metadata: None,
+        };
+
+        module
+            .register_trigger(trigger_a.clone())
+            .await
+            .expect("A registration should succeed");
+        module
+            .register_trigger(trigger_b)
+            .await
+            .expect("B registration should succeed");
+
+        // Stale cleanup for Worker A must not remove Worker B's route.
+        let removed_a = module
+            .unregister_router(
+                "POST",
+                "/api/platforms/:platform/connect",
+                &trigger_a.id,
+                trigger_a.worker_id,
+            )
+            .await
+            .expect("A unregistration should succeed");
+        assert!(!removed_a, "stale owner should not remove the route");
+
+        let router = module
+            .get_router("POST", "/api/platforms/:platform/connect")
+            .expect("parameterized route should still exist after stale unregister");
+        assert_eq!(router.function_id, "fn::connect_b");
+    }
+
+    #[tokio::test]
+    async fn unregister_router_removes_route_when_owner_matches() {
+        // Owner-aware unregister still removes the route for the real owner.
+        let module = make_worker_with_cors(None);
+
+        let worker = uuid::Uuid::new_v4();
+        let trigger = Trigger {
+            id: "http-owned".to_string(),
+            trigger_type: "http".to_string(),
+            function_id: "fn::owned".to_string(),
+            config: json!({
+                "api_path": "/api/owned",
+                "http_method": "GET"
+            }),
+            worker_id: Some(worker),
+            metadata: None,
+        };
+
+        module
+            .register_trigger(trigger.clone())
+            .await
+            .expect("registration should succeed");
+
+        module
+            .unregister_trigger(trigger)
+            .await
+            .expect("unregistration should succeed");
+
+        assert!(module.get_router("GET", "/api/owned").is_none());
+    }
+
+    #[tokio::test]
     async fn register_trigger_requires_api_path() {
         let module = make_worker_with_cors(None);
         let trigger = Trigger {
@@ -1121,7 +1729,7 @@ mod tests {
         let module = make_worker_with_cors(None);
 
         let removed = module
-            .unregister_router("GET", "/missing")
+            .unregister_router("GET", "/missing", "missing-trigger", None)
             .await
             .expect("unregister should succeed");
 

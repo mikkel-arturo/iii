@@ -3,7 +3,7 @@ import { createRequire } from 'node:module'
 import * as os from 'node:os'
 import { type Data, WebSocket } from 'ws'
 import { ChannelReader, ChannelWriter } from './channels'
-import { IIIInvocationError, isErrorBody } from './errors'
+import { InvocationError, isErrorBody } from './errors'
 import {
   DEFAULT_BRIDGE_RECONNECTION_CONFIG,
   DEFAULT_INVOCATION_TIMEOUT_MS,
@@ -11,8 +11,8 @@ import {
   type IIIConnectionState,
   type IIIReconnectionConfig,
 } from './iii-constants'
+import type { HttpInvocationConfig } from '@iii-dev/helpers/http'
 import {
-  type HttpInvocationConfig,
   type IIIMessage,
   type InvocationResultMessage,
   type InvokeFunctionMessage,
@@ -21,13 +21,12 @@ import {
   type RegisterTriggerMessage,
   type RegisterTriggerTypeMessage,
   type StreamChannelRef,
-  type TriggerAction as TriggerActionType,
   type TriggerRegistrationResultMessage,
   type TriggerRequest,
   type WorkerRegisteredMessage,
 } from './iii-types'
-import { registerWorkerGauges, stopWorkerGauges } from '@iii-dev/observability'
-import { getMeter, getTracer } from '@iii-dev/observability/internal'
+import { registerWorkerGauges, stopWorkerGauges } from '@iii-dev/helpers/observability'
+import { getMeter, getTracer } from '@iii-dev/helpers/observability/internal'
 import { SpanKind } from '@opentelemetry/api'
 import type { IStream } from './stream'
 import { detectProjectName } from './utils'
@@ -44,12 +43,12 @@ import {
   SeverityNumber,
   shutdownOtel,
   withSpan,
-} from '@iii-dev/observability'
+} from '@iii-dev/helpers/observability'
 import type { TriggerHandler } from './triggers'
 import type {
   FunctionRef,
+  IIIClient,
   Invocation,
-  ISdk,
   RegisterFunctionOptions,
   RemoteFunctionData,
   RemoteFunctionHandler,
@@ -70,7 +69,7 @@ function getDefaultWorkerName(): string {
   return `${os.hostname()}:${process.pid}`
 }
 
-/** @internal */
+/** Worker labels reported to the engine (language, framework, project). */
 export type TelemetryOptions = {
   language?: string
   project_name?: string
@@ -83,7 +82,7 @@ export type TelemetryOptions = {
  *
  * @example
  * ```typescript
- * const iii = registerWorker('ws://localhost:49134', {
+ * const worker = registerWorker('ws://localhost:49134', {
  *   workerName: 'my-worker',
  *   invocationTimeoutMs: 10000,
  *   reconnectionConfig: { maxRetries: 5 },
@@ -93,6 +92,11 @@ export type TelemetryOptions = {
 export type InitOptions = {
   /** Display name for this worker. Defaults to `hostname:pid`. */
   workerName?: string
+  /**
+   * One-line, human/LLM-readable summary of what this worker does.
+   * Surfaces in `engine::workers::list` / `engine::workers::info`.
+   */
+  workerDescription?: string
   /** Enable worker metrics via OpenTelemetry. Defaults to `true`. */
   enableMetricsReporting?: boolean
   /** Default timeout for `trigger()` in milliseconds. Defaults to `30000`. */
@@ -115,7 +119,7 @@ export type InitOptions = {
   telemetry?: TelemetryOptions
 }
 
-class Sdk implements ISdk {
+class Sdk implements IIIClient {
   private ws?: WebSocket
   private functions = new Map<string, RemoteFunctionData>()
   private invocations = new Map<string, Invocation & { timeout?: NodeJS.Timeout }>()
@@ -123,6 +127,7 @@ class Sdk implements ISdk {
   private triggerTypes = new Map<string, RemoteTriggerTypeData>()
   private messagesToSend: Record<string, unknown>[] = []
   private workerName: string
+  private workerDescription?: string
   private workerId?: string
   private reconnectTimeout?: NodeJS.Timeout
   private metricsReportingEnabled: boolean
@@ -137,6 +142,7 @@ class Sdk implements ISdk {
     private readonly options?: InitOptions,
   ) {
     this.workerName = options?.workerName ?? getDefaultWorkerName()
+    this.workerDescription = options?.workerDescription
     this.metricsReportingEnabled = options?.enableMetricsReporting ?? true
     this.invocationTimeoutMs = options?.invocationTimeoutMs ?? DEFAULT_INVOCATION_TIMEOUT_MS
     this.reconnectionConfig = {
@@ -161,7 +167,7 @@ class Sdk implements ISdk {
    *
    * @example
    * ```typescript
-   * iii.registerTriggerType(
+   * worker.registerTriggerType(
    *   { id: 'my-trigger', description: 'Custom trigger' },
    *   {
    *     async registerTrigger({ id, function_id, config }) { },
@@ -228,7 +234,7 @@ class Sdk implements ISdk {
    *
    * @example
    * ```typescript
-   * const trigger = iii.registerTrigger({
+   * const trigger = worker.registerTrigger({
    *   type: 'http',
    *   function_id: 'greet',
    *   config: { api_path: '/greet', http_method: 'GET' },
@@ -274,7 +280,7 @@ class Sdk implements ISdk {
    *
    * @example
    * ```typescript
-   * const fn = iii.registerFunction(
+   * const fn = worker.registerFunction(
    *   'greet',
    *   async (input: { name: string }) => {
    *     return { message: `Hello, ${input.name}!` }
@@ -364,8 +370,14 @@ class Sdk implements ISdk {
           if (getTracer()) {
             const parentContext = extractContext(traceparent, baggage)
 
+            // INTERNAL and named `execute` (not `call`/`trigger`): the engine
+            // already emits the SERVER `call <fn>` span for this hop AND a
+            // `trigger <fn>` span from fire_triggers. Reusing either name would
+            // duplicate an engine span under the worker's service. `execute` is
+            // unique, so the worker handler span reads as a clean internal child
+            // of the engine's call span (and is collapsible by a single rule).
             return context.with(parentContext, () =>
-              withSpan(`call ${functionId}`, { kind: SpanKind.SERVER }, async () => await runHandler()),
+              withSpan(`execute ${functionId}`, { kind: SpanKind.INTERNAL }, async () => await runHandler()),
             )
           }
 
@@ -391,7 +403,7 @@ class Sdk implements ISdk {
 
   /**
    * @internal Implementation backing the `createChannel` helper in the
-   * `iii-sdk/helpers` submodule. Not part of the public `ISdk` surface.
+   * `iii-sdk/helpers` submodule. Not part of the public `IIIClient` surface.
    *
    * Creates a streaming channel pair for worker-to-worker data transfer.
    * Returns a {@link Channel} with a local writer/reader and serializable refs
@@ -432,17 +444,17 @@ class Sdk implements ISdk {
    * import { TriggerAction } from 'iii-sdk'
    *
    * // Synchronous
-   * const result = await iii.trigger({ function_id: 'get-order', payload: { id: '123' } })
+   * const result = await worker.trigger({ function_id: 'get-order', payload: { id: '123' } })
    *
    * // Enqueue
-   * const { messageReceiptId } = await iii.trigger({
+   * const { messageReceiptId } = await worker.trigger({
    *   function_id: 'payments::charge',
    *   payload: { orderId: '123', amount: 49.99 },
    *   action: TriggerAction.Enqueue({ queue: 'payment' }),
    * })
    *
    * // Fire-and-forget
-   * iii.trigger({
+   * worker.trigger({
    *   function_id: 'notifications::send',
    *   payload: { userId: '123' },
    *   action: TriggerAction.Void(),
@@ -453,7 +465,7 @@ class Sdk implements ISdk {
     const { function_id, payload, action, timeoutMs } = request
     const effectiveTimeout = timeoutMs ?? this.invocationTimeoutMs
 
-    // Void is fire-and-forget — no invocation_id, no response
+    // Void is fire-and-forget, no invocation_id, no response
     if (action?.type === 'void') {
       const traceparent = injectTraceparent()
       const baggage = injectBaggage()
@@ -478,7 +490,7 @@ class Sdk implements ISdk {
         if (invocation) {
           this.invocations.delete(invocation_id)
           reject(
-            new IIIInvocationError({
+            new InvocationError({
               code: 'TIMEOUT',
               message: `invocation timed out after ${effectiveTimeout}ms`,
               function_id,
@@ -522,6 +534,7 @@ class Sdk implements ISdk {
         runtime: 'node',
         version: SDK_VERSION,
         name: this.workerName,
+        description: this.workerDescription,
         os: getOsInfo(),
         pid: process.pid,
         isolation: process.env.III_ISOLATION || null,
@@ -538,7 +551,7 @@ class Sdk implements ISdk {
 
   /**
    * @internal Implementation backing the `createStream` helper in the
-   * `iii-sdk/helpers` submodule. Not part of the public `ISdk` surface.
+   * `iii-sdk/helpers` submodule. Not part of the public `IIIClient` surface.
    *
    * Registers a custom stream implementation, overriding the engine default
    * for the given stream name. Registers 5 of the 6 `IStream` methods
@@ -578,7 +591,7 @@ class Sdk implements ISdk {
     this.invocations.clear()
 
     // Close WebSocket. Swallow any close-time errors (most commonly
-    // "WebSocket was closed before the connection was established" —
+    // "WebSocket was closed before the connection was established",
     // emitted when `close()` fires while still in CONNECTING state
     // and there's no error listener). Without a catch-all listener,
     // that event becomes an unhandled exception because we remove
@@ -589,7 +602,7 @@ class Sdk implements ISdk {
       try {
         this.ws.close()
       } catch {
-        // ignore — shutting down anyway
+        // ignore, shutting down anyway
       }
       this.ws = undefined
     }
@@ -803,7 +816,7 @@ class Sdk implements ISdk {
   }
 
   /**
-   * Wrap a wire-format `ErrorBody` in {@link IIIInvocationError} so callers get
+   * Wrap a wire-format `ErrorBody` in {@link InvocationError} so callers get
    * a real `Error` with a readable `.message` and a typed `.code`. Pass-through
    * for values that are already `Error` subclasses. Everything else is wrapped
    * under an `UNKNOWN` code so `String(err) !== '[object Object]'` holds for
@@ -814,7 +827,7 @@ class Sdk implements ISdk {
       return error
     }
     if (isErrorBody(error)) {
-      return new IIIInvocationError({
+      return new InvocationError({
         code: error.code,
         message: error.message,
         function_id,
@@ -829,7 +842,7 @@ class Sdk implements ISdk {
       typeof error === 'string'
         ? error
         : (JSON.stringify(error) ?? String(error))
-    return new IIIInvocationError({
+    return new InvocationError({
       code: 'UNKNOWN',
       message,
       function_id,
@@ -1026,21 +1039,21 @@ class Sdk implements ISdk {
 }
 
 /**
- * Factory object that constructs routing actions for {@link ISdk.trigger}.
+ * Factory object that constructs routing actions for {@link IIIClient.trigger}.
  *
  * @example
  * ```typescript
  * import { TriggerAction } from 'iii-sdk'
  *
  * // Enqueue to a named queue
- * iii.trigger({
+ * worker.trigger({
  *   function_id: 'process',
  *   payload: { data: 'hello' },
  *   action: TriggerAction.Enqueue({ queue: 'jobs' }),
  * })
  *
  * // Fire-and-forget
- * iii.trigger({
+ * worker.trigger({
  *   function_id: 'notify',
  *   payload: {},
  *   action: TriggerAction.Void(),
@@ -1056,12 +1069,12 @@ export const TriggerAction = {
    * @param opts - Queue routing options.
    * @param opts.queue - Name of the target queue.
    */
-  Enqueue: (opts: { queue: string }): TriggerActionType => ({ type: 'enqueue', ...opts }),
+  Enqueue: (opts: { queue: string }) => ({ type: 'enqueue' as const, ...opts }),
   /**
    * Fire-and-forget routing. The engine forwards the invocation without
    * waiting for a response or queuing the job.
    */
-  Void: (): TriggerActionType => ({ type: 'void' }),
+  Void: () => ({ type: 'void' as const }),
 } as const
 
 /**
@@ -1070,15 +1083,15 @@ export const TriggerAction = {
  *
  * @param address - WebSocket URL of the III engine (e.g. `ws://localhost:49134`).
  * @param options - Optional {@link InitOptions} for worker name, timeouts, reconnection, and OTel.
- * @returns A connected {@link ISdk} instance.
+ * @returns A connected {@link IIIClient} instance.
  *
  * @example
  * ```typescript
  * import { registerWorker } from 'iii-sdk'
  *
- * const iii = registerWorker(process.env.III_URL ?? 'ws://localhost:49134', {
+ * const worker = registerWorker(process.env.III_URL ?? 'ws://localhost:49134', {
  *   workerName: 'my-worker',
  * })
  * ```
  */
-export const registerWorker = (address: string, options?: InitOptions): ISdk => new Sdk(address, options)
+export const registerWorker = (address: string, options?: InitOptions): IIIClient => new Sdk(address, options)

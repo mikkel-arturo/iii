@@ -16,9 +16,9 @@ The engine has been running since Chapter 1. Start the console, a browser UI for
 iii console
 ```
 
-Open it at [http://127.0.0.1:3113](http://127.0.0.1:3113). Every worker you added is listed with the
-functions and triggers it registered. Create a link and follow it a few times, and watch the
-invocations stream in live:
+Open it at [http://127.0.0.1:3113/traces](http://127.0.0.1:3113/traces). Every worker you added is
+listed with the functions and triggers it registered. Navigate to the traces tab and run the below
+command to watch the invocations stream live:
 
 ```bash
 curl -s -X POST http://127.0.0.1:3111/links \
@@ -33,47 +33,27 @@ back:
 
 You didn't add a tracing library or thread a request ID between services to get this.
 `iii project init` added the `iii-observability` worker to `config.yaml`, and from then on every
-request gets a trace and every `Logger` line is collected automatically, across workers. That is the
-point worth pausing on: in iii, end-to-end observability is a property of the system, not a
-per-service add-on.
+request gets a trace and every `Logger` line is collected automatically, across workers. In iii
+end-to-end observability is an inherent property of the system.
 
 <Info>
   **iii-observability emits OpenTelemetry.** Its traces, metrics, and logs are emitted as OTel, so
-  you aren't locked into the console. Point the worker at Honeycomb, Grafana, Datadog, or any other
-  OTel-compatible backend and your iii traces flow straight in. See the worker's configuration on
+  you aren't locked into the console. You can point the worker at Honeycomb, Grafana, Datadog, or
+  any other OTel-compatible backend. See the worker's configuration on
   [workers.iii.dev/workers/iii-observability](https://workers.iii.dev/workers/iii-observability).
 </Info>
 
-For most teams the console (or your own OTel backend) is all you need day to day. The rest of this
-chapter is an optional deep dive: reading the same logs and traces directly from the engine, which
-is how you'd wire observability into scripts, CI, or an agent.
+For most teams the console (or your own OTel backend) is all you need day to day.
 
-<CardGroup cols={2}>
-  <Card title="Use the console" icon="gauge" href="/tutorials/linkly/persistence">
-    The common path. Watch logs and traces in the console and continue to Chapter 3.
-  </Card>
-  <Card title="Go deeper" icon="terminal" href="#log-the-resolve">
-    Read on to pull the same logs and traces from the engine with `iii trigger`.
-  </Card>
-</CardGroup>
+<Note>
+  The rest of this chapter is an optional deep dive on how to read the same logs and traces directly
+  from the engine. You can jump to [Ch. 3: Persist everything](/tutorials/linkly/persistence) if you
+  prefer.
+</Note>
 
-## Log the resolve
+## Read the logs
 
-`link::create` already logs. Add a matching line to `link::resolve` so every lookup is recorded.
-Edit `link/src/index.ts`:
-
-```typescript src/index.ts {6}
-worker.registerFunction("link::resolve", async (payload: { code: string }) => {
-  const stored = await worker.trigger<{ scope: string; key: string }, { url: string } | null>({
-    function_id: "state::get",
-    payload: { scope: "links", key: payload.code },
-  });
-  logger.info("link resolved", { code: payload.code, found: !!stored?.url });
-  return { url: stored?.url ?? null };
-});
-```
-
-Save the file (the worker reloads), then drive some traffic:
+Create some traffic:
 
 ```bash
 curl -s -X POST http://127.0.0.1:3111/links \
@@ -82,13 +62,16 @@ for n in $(seq 1 5); do curl -s -o /dev/null http://127.0.0.1:3111/s/iii; done
 curl -s -o /dev/null http://127.0.0.1:3111/s/missing
 ```
 
-## Read the logs
+Then check the logs:
 
 ```bash
 iii trigger engine::logs::list limit=100 \
   | jq '.logs[]
       | select(.body == "link resolved")
-      | { body, "log.data": .attributes["log.data"], trace_id, service_name }'
+      | { body,
+          data: (.attributes | with_entries(select(.key | IN("trace_id","span_id","service.name") | not))),
+          trace_id,
+          service_name }'
 ```
 
 <Info>
@@ -99,27 +82,30 @@ iii trigger engine::logs::list limit=100 \
 ```json
 {
   "body": "link resolved",
-  "log.data": { "code": "iii", "found": true },
-  "trace_id": "6b20e1fe001742c25bb7dc570b57fe42",
+  "data": {
+    "log.data": {
+      "code": "iii",
+      "found": true
+    }
+  },
+  "trace_id": "797d427e4d0c3491cfc45f0d40c4e1b1",
   "service_name": "iii-node"
 }
 ```
 
-`log.data` is exactly what you passed to `logger.info`. The `trace_id` ties the log to the trace it
-came from, which is where you look next.
+`data` is exactly what you passed to `logger.info`; the engine stores those fields as individual log
+attributes, so the `jq` above gathers everything except the OTel metadata keys. The `trace_id` ties
+the log to the trace it came from, which is where you look next.
 
 ## Follow a redirect across workers
 
-Every request is also a trace. Grab the most recent redirect:
+Everything that happens on a iii system has a trace. So the http requests have traces that cover the
+full execution context of the request. Grab the most recent redirect's `trace_id` and walk the whole
+request as a tree. Capturing the id into a shell variable keeps this a single paste:
 
 ```bash
-iii trigger engine::traces::list name="GET /s/:code" limit=1
-```
-
-Take the `trace_id` from the result and walk the whole request as a tree:
-
-```bash
-iii trigger engine::traces::tree trace_id=<trace_id> | jq -r '
+trace_id=$(iii trigger engine::traces::list name="GET /s/:code" limit=1 | jq -r '.spans[0].trace_id')
+iii trigger engine::traces::tree trace_id="$trace_id" | jq -r '
   def walk(depth):
     ("  " * depth // "") + .name + " (" + .service_name + ") "
       + (((.end_time_unix_nano - .start_time_unix_nano) / 1e6 * 1000 | round) / 1000 | tostring) + " ms",
@@ -135,36 +121,40 @@ iii trigger engine::traces::tree trace_id=<trace_id> | jq -r '
 </Info>
 
 ```text
-GET /s/:code (iii) 2.32 ms
-  call http::redirect (iii) 2.228 ms
-    call http::redirect (iii-node) 1.335 ms
-      handle_invocation link::resolve (iii) 0.624 ms
-        call link::resolve (iii) 0.582 ms
-          call link::resolve (iii-node) 0.174 ms
+GET /s/:code (iii) 2.044 ms
+  execute http::redirect (iii-node) 1.444 ms
+    execute link::resolve (iii-node) 0.52 ms
 ```
 
-That is the redirect arriving through `iii-http`, calling `http::redirect` in `link`, which calls
-`link::resolve` back through the engine. The per-span timing shows where the request spends its
-time: the view you reach for when a link feels slow.
+This shows the redirect arriving through `/s/:code` via the `iii-http` worker's Trigger, calling
+`http::redirect` in `link`, which then calls `link::resolve` in the `link` worker via the engine.
+The per-span timing shows where the request spends its time.
 
 <Note>
-  Worker spans export on a short delay, so a brand-new request's trace can look truncated for a
-  second or two. Give it a moment, or read a slightly older trace.
+  Worker spans export on a short delay, so a brand-new request's trace can be missing or look
+  truncated for a second or two. If you encounter this wait a few seconds and try again.
 </Note>
 
-## Find the slowest links
+## Compare traces to find the slowest links
 
-To compare many requests, list the redirect spans sorted by duration, slowest first:
+To compare many traces it's possible to filter, list, and sort them in one operation. Here are the
+redirect spans sorted by duration, slowest first:
 
 ```bash
-iii trigger engine::traces::list name="GET /s/:code" sort_by=duration_ms sort_order=desc limit=10 | jq -c '[.spans[] |
-  ((.end_time_unix_nano - .start_time_unix_nano) / 1e6 * 1000 | round / 1000)]'
+iii trigger engine::traces::list name="GET /s/:code" sort_by=duration_ms sort_order=desc limit=10 \
+  | jq -r '.spans[]
+      | "\(((.end_time_unix_nano - .start_time_unix_nano) / 1e6 * 1000 | round) / 1000) ms  \(.trace_id)"'
+```
+
+Each line pairs a duration with its `trace_id`, slowest first:
+
+```text
+2.044 ms  6b20e1fe001742c25bb7dc570b57fe42
+1.700 ms  797d427e4d0c3491cfc45f0d40c4e1b1
 ```
 
 The slowest redirects rise to the top; open any one's `trace_id` with `engine::traces::tree` to see
 which hop is responsible.
-
-{/* TODO(validation): sort_by=duration_ms is currently inverted/unsorted; re-verify the ordering once the engine fix lands. */}
 
 ## Conclusion
 

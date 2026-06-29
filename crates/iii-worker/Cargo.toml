@@ -26,15 +26,17 @@ iii-filesystem = { path = "../iii-filesystem" }
 iii-network = { path = "../iii-network" }
 # TODO: switch to crates.io pin before shipping; path dep for co-development
 iii-sdk = { path = "../../sdk/packages/rust/iii" }
-iii-observability = { workspace = true }
+iii-helpers = { workspace = true }
 iii-shell-client = { path = "../iii-shell-client" }
 iii-shell-proto = { path = "../iii-shell-proto" }
 iii-supervisor = { path = "../iii-supervisor" }
-msb_krun = { version = "0.1.9", features = ["net", "blk"] }
+msb_krun = { version = "0.1.16", features = ["net", "blk"] }
 oci-client = "0.16"
 oci-spec = "0.9"
 tokio = { version = "1", features = ["process", "macros", "rt-multi-thread", "fs", "signal", "time", "io-std"] }
 clap = { version = "4", features = ["derive"] }
+# MDX CLI reference generation for the hidden `gen-cli-docs` subcommand.
+iii-clap-docs = { path = "../iii-clap-docs" }
 colored = "3.0.0"
 cliclack = "0.3"
 console = "0.16"
@@ -44,11 +46,10 @@ scaffolder-core = { workspace = true }
 serde_json = "1"
 serde_yaml = "0.9"
 semver = { workspace = true }
-serde_yml = "0.0.12"
 anyhow = "1.0.100"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 async-trait = "0.1.89"
-nix = { version = "0.30.1", features = ["signal", "process", "term"] }
+nix = { version = "0.30.1", features = ["fs", "signal", "process", "term"] }
 dirs = "6"
 sha2 = "0.10"
 hex = "0.4"

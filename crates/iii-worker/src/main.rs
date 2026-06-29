@@ -7,9 +7,68 @@
 use clap::{CommandFactory, FromArgMatches};
 use iii_worker::{Cli, Commands};
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+/// A `stdout` tracing writer that never reports I/O errors back to the fmt
+/// layer. The fmt layer's sole error path is an `eprintln!`, which PANICS
+/// when stderr is *also* a broken pipe — precisely the engine-death case for
+/// the spawned daemons (`worker-manager-daemon`, `sandbox-daemon`): the engine
+/// consumed both fds 1 and 2, so when it dies the connection thread's very
+/// next reconnect log would panic the process (exit 101) before the
+/// engine-gone reaper runs. Swallowing the write error keeps the daemon alive;
+/// it then dup2's fds 1/2 onto its durable exit log
+/// (`daemon_exit::redirect_stdio_to_exit_log`) and these same writes land there
+/// as forensics. For one-shot CLI use it just turns a `… | head` EPIPE into a
+/// silent drop instead of a panic — strictly better either way.
+struct ResilientStdout;
+
+impl std::io::Write for ResilientStdout {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let _ = std::io::Write::write_all(&mut std::io::stdout(), buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        Ok(())
+    }
+}
+
+impl tracing_subscriber::fmt::MakeWriter<'_> for ResilientStdout {
+    type Writer = ResilientStdout;
+    fn make_writer(&self) -> Self::Writer {
+        ResilientStdout
+    }
+}
+
+/// Print a failed worker op's error — unless it is the bare rc wrapper, in
+/// which case the underlying handler already wrote its real, colored error
+/// to this terminal (or to the tailed log file) and a second "[W900]
+/// internal: iii worker X exited with rc N" line would only mislabel a user
+/// error as internal. The suppression assumes handlers always print before
+/// returning nonzero (true today for every shim-reachable path); the debug
+/// line keeps a silent-failure regression diagnosable via RUST_LOG=debug.
+fn report_op_error(e: &iii_worker::core::WorkerOpError) {
+    if iii_worker::cli::host_shim::is_bare_rc_wrapper(e) {
+        tracing::debug!(error = %e, "suppressed bare rc wrapper (handler reported directly)");
+        return;
+    }
+    eprintln!("error: [{}] {}", e.kind().code(), e);
+}
+
+fn main() -> anyhow::Result<()> {
+    // FIRST, before the tokio runtime spawns worker threads: capture (and
+    // scrub from the env) any inherited lifeline facts. The capture mutates
+    // the process environment, which is only sound while single-threaded —
+    // see daemon_exit::capture_early.
+    iii_worker::daemon_exit::capture_early();
+
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(async_main())
+}
+
+async fn async_main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
+        .with_writer(ResilientStdout)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
@@ -24,7 +83,7 @@ async fn main() -> anyhow::Result<()> {
     // are logged but never propagated. See T18 in the bundle plan.
     let _ = iii_worker::cli::bundle_download::sweep_orphans();
 
-    // The `iii` dispatcher routes `iii sandbox ...` here, but our root
+    // The `iii` dispatcher routes `iii worker sandbox ...` here, but our root
     // bin_name is "iii worker" so clap renders `Usage: iii worker sandbox`.
     // Peek at argv: if the first non-flag arg is `sandbox`, override the
     // root bin_name to `iii` for that one invocation. Per-subcommand bin_name
@@ -45,6 +104,11 @@ async fn main() -> anyhow::Result<()> {
         Cli::from_arg_matches(&matches).map_err(|e| anyhow::anyhow!("cli parse: {e}"))?;
 
     let exit_code = match cli_args.command {
+        // Offline build tooling: render the committed MDX CLI reference.
+        Commands::GenDocs { out } => {
+            iii_worker::cli::gen_docs::run(Cli::command(), out.as_deref())?;
+            0
+        }
         Commands::Add {
             args,
             force,
@@ -87,11 +151,10 @@ async fn main() -> anyhow::Result<()> {
                 // user sees as extra noise that scrolls real progress
                 // off-screen. Keep the sink quiet on the CLI path.
                 let sink = StderrSink::new(true);
-                let result =
-                    core_add::run(opts, &ctx, &sink, &CliHostShim, core_add::CallerMode::Cli).await;
+                let result = core_add::run(opts, &ctx, &sink, &CliHostShim).await;
 
                 if let Err(e) = result {
-                    eprintln!("error: [{}] {}", e.kind().code(), e);
+                    report_op_error(&e);
                     fail_count += 1;
                 }
             }
@@ -141,7 +204,7 @@ async fn main() -> anyhow::Result<()> {
             match core_remove::run(opts, &ctx, &sink, &CliHostShim).await {
                 Ok(_) => 0,
                 Err(e) => {
-                    eprintln!("error: [{}] {}", e.kind().code(), e);
+                    report_op_error(&e);
                     1
                 }
             }
@@ -173,10 +236,8 @@ async fn main() -> anyhow::Result<()> {
                 // policy so we don't duplicate Stage events on top of
                 // the inner handler's progress output.
                 let sink = StderrSink::new(true);
-                if let Err(e) =
-                    core_add::run(opts, &ctx, &sink, &CliHostShim, core_add::CallerMode::Cli).await
-                {
-                    eprintln!("error: [{}] {}", e.kind().code(), e);
+                if let Err(e) = core_add::run(opts, &ctx, &sink, &CliHostShim).await {
+                    report_op_error(&e);
                     fail_count += 1;
                 }
             }
@@ -199,7 +260,7 @@ async fn main() -> anyhow::Result<()> {
             match core_update::run(opts, &ctx, &sink, &CliHostShim).await {
                 Ok(_) => 0,
                 Err(e) => {
-                    eprintln!("error: [{}] {}", e.kind().code(), e);
+                    report_op_error(&e);
                     1
                 }
             }
@@ -256,7 +317,7 @@ async fn main() -> anyhow::Result<()> {
             match core_clear::run(opts, &ctx, &sink, &CliHostShim).await {
                 Ok(_) => 0,
                 Err(e) => {
-                    eprintln!("error: [{}] {}", e.kind().code(), e);
+                    report_op_error(&e);
                     1
                 }
             }
@@ -287,7 +348,7 @@ async fn main() -> anyhow::Result<()> {
             match core_start::run(opts, &ctx, &sink, &CliHostShim).await {
                 Ok(_) => 0,
                 Err(e) => {
-                    eprintln!("error: [{}] {}", e.kind().code(), e);
+                    report_op_error(&e);
                     1
                 }
             }
@@ -319,7 +380,7 @@ async fn main() -> anyhow::Result<()> {
             match core_stop::run(opts, &ctx, &sink, &CliHostShim).await {
                 Ok(_) => 0,
                 Err(e) => {
-                    eprintln!("error: [{}] {}", e.kind().code(), e);
+                    report_op_error(&e);
                     1
                 }
             }
@@ -395,7 +456,7 @@ async fn main() -> anyhow::Result<()> {
                     0
                 }
                 Err(e) => {
-                    eprintln!("error: [{}] {}", e.kind().code(), e);
+                    report_op_error(&e);
                     1
                 }
             }
@@ -502,9 +563,7 @@ async fn main() -> anyhow::Result<()> {
             //
             // TODO(msb_krun upstream): remove this std::thread dispatch
             // once virtio-blk Drop uses `Handle::try_current()` instead
-            // of unconditional `block_on`. Draft issue at
-            // ~/.claude/plans/msb_krun-upstream-issue-draft.md — file via
-            // `gh issue create` against microsandbox/microsandbox.
+            // of unconditional `block_on`.
             let handle = std::thread::Builder::new()
                 .name("iii-worker-vm-boot".to_string())
                 .spawn(move || iii_worker::cli::vm_boot::run(&args))
@@ -523,12 +582,33 @@ async fn main() -> anyhow::Result<()> {
         Commands::WatchSource(args) => {
             let project = std::path::PathBuf::from(&args.project);
             let worker = args.worker.clone();
-            iii_worker::cli::source_watcher::watch_and_restart(
+            // Authoritative workspace model from `iii worker start` (see
+            // WatchSourceArgs::overlay). Passed into the dispatcher so it never
+            // re-derives overlay-ness from the on-disk marker.
+            let overlay = args.overlay;
+            let watch = iii_worker::cli::source_watcher::watch_and_restart(
                 worker,
                 project,
-                iii_worker::cli::source_watcher::restart_via_cli,
-            )
-            .await?;
+                move |name: &str, kind| {
+                    iii_worker::cli::source_watcher::restart_via_cli(name, kind, overlay)
+                },
+            );
+            // Engine anchor: the watcher sidecar must not outlive the engine
+            // that (transitively) spawned it — `killall -9 iii` previously
+            // left one per dev worker running forever.
+            match iii_worker::daemon_exit::engine_pid_from_env() {
+                Some(pid) => {
+                    tokio::select! {
+                        r = watch => { r?; }
+                        _ = tokio::task::spawn_blocking(move || {
+                            iii_worker::daemon_exit::blocking_wait_pid_gone(pid)
+                        }) => {
+                            eprintln!("watch-source: engine pid {pid} exited; stopping");
+                        }
+                    }
+                }
+                None => watch.await?,
+            }
             0
         }
     };

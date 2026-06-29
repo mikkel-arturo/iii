@@ -14,7 +14,6 @@ import {
   type RegisterTriggerMessage,
   type RegisterTriggerTypeMessage,
   type StreamChannelRef,
-  type TriggerAction as TriggerActionType,
   type TriggerRegistrationResultMessage,
   type TriggerRequest,
 } from './iii-types'
@@ -46,7 +45,7 @@ export type TelemetryOptions = {
  *
  * @example
  * ```typescript
- * const iii = registerWorker('ws://localhost:49135', {
+ * const worker = registerWorker('ws://localhost:49135', {
  *   invocationTimeoutMs: 10000,
  *   reconnectionConfig: { maxRetries: 5 },
  * })
@@ -104,7 +103,7 @@ class Sdk implements ISdk {
    *
    * @example
    * ```typescript
-   * iii.registerTriggerType(
+   * worker.registerTriggerType(
    *   { id: 'my-trigger', description: 'Custom trigger' },
    *   {
    *     async registerTrigger({ id, function_id, config }) { },
@@ -169,7 +168,7 @@ class Sdk implements ISdk {
    *
    * @example
    * ```typescript
-   * const trigger = iii.registerTrigger({
+   * const trigger = worker.registerTrigger({
    *   type: 'http',
    *   function_id: 'greet',
    *   config: { api_path: '/greet', http_method: 'GET' },
@@ -215,7 +214,7 @@ class Sdk implements ISdk {
    *
    * @example
    * ```typescript
-   * const fn = iii.registerFunction(
+   * const fn = worker.registerFunction(
    *   'greet',
    *   async (input: { name: string }) => {
    *     return { message: `Hello, ${input.name}!` }
@@ -304,17 +303,17 @@ class Sdk implements ISdk {
    * import { TriggerAction } from 'iii-browser-sdk'
    *
    * // Synchronous
-   * const result = await iii.trigger({ function_id: 'get-order', payload: { id: '123' } })
+   * const result = await worker.trigger({ function_id: 'get-order', payload: { id: '123' } })
    *
    * // Enqueue
-   * const { messageReceiptId } = await iii.trigger({
+   * const { messageReceiptId } = await worker.trigger({
    *   function_id: 'payments::charge',
    *   payload: { orderId: '123', amount: 49.99 },
    *   action: TriggerAction.Enqueue({ queue: 'payment' }),
    * })
    *
    * // Fire-and-forget
-   * iii.trigger({
+   * worker.trigger({
    *   function_id: 'notifications::send',
    *   payload: { userId: '123' },
    *   action: TriggerAction.Void(),
@@ -764,14 +763,14 @@ class Sdk implements ISdk {
  * import { TriggerAction } from 'iii-browser-sdk'
  *
  * // Enqueue to a named queue
- * iii.trigger({
+ * worker.trigger({
  *   function_id: 'process',
  *   payload: { data: 'hello' },
  *   action: TriggerAction.Enqueue({ queue: 'jobs' }),
  * })
  *
  * // Fire-and-forget
- * iii.trigger({
+ * worker.trigger({
  *   function_id: 'notify',
  *   payload: {},
  *   action: TriggerAction.Void(),
@@ -787,12 +786,12 @@ export const TriggerAction = {
    * @param opts - Queue routing options.
    * @param opts.queue - Name of the target queue.
    */
-  Enqueue: (opts: { queue: string }): TriggerActionType => ({ type: 'enqueue', ...opts }),
+  Enqueue: (opts: { queue: string }) => ({ type: 'enqueue' as const, ...opts }),
   /**
    * Fire-and-forget routing. The engine forwards the invocation without
    * waiting for a response or queuing the job.
    */
-  Void: (): TriggerActionType => ({ type: 'void' }),
+  Void: () => ({ type: 'void' as const }),
 } as const
 
 /**
@@ -807,7 +806,7 @@ export const TriggerAction = {
  * ```typescript
  * import { registerWorker } from 'iii-browser-sdk'
  *
- * const iii = registerWorker('ws://localhost:49135')
+ * const worker = registerWorker('ws://localhost:49135')
  * ```
  */
 export const registerWorker = (address: string, options?: InitOptions): ISdk => new Sdk(address, options)

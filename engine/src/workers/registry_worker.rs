@@ -301,6 +301,15 @@ impl ExternalWorkerProcess {
         let args = spawn_args(name, port, config_path.as_deref());
         let mut cmd = tokio::process::Command::new(&worker_binary);
         cmd.args(&args).stdout(stdout_file).stderr(stderr_file);
+        // Anchor the whole spawn tree to THIS engine. `iii-worker start`
+        // detaches the real worker (VM / binary / watcher sidecar) and
+        // exits, so a lifeline pipe can't span the chain — but
+        // III_ENGINE_PID flows down inherited environments (deliberately
+        // unscrubbed; see iii-worker's daemon_exit module) and arms the
+        // VM/watcher engine-death self-watches. Without it a `killall -9
+        // iii` left every managed worker running: this path — not
+        // external.rs — is how production workers are spawned.
+        cmd.env("III_ENGINE_PID", std::process::id().to_string());
 
         let child = cmd
             .spawn()
@@ -872,6 +881,9 @@ mod tests {
     /// stdlib has loosened the rule and the production code can be
     /// simplified.
     #[test]
+    // The nonsensical combination is the point: this test asserts the stdlib
+    // still rejects it. Clippy flagging it is a true positive on intent.
+    #[allow(clippy::nonsensical_open_options)]
     fn truncate_plus_append_open_options_combination_is_illegal() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("combo.log");

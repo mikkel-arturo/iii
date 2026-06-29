@@ -37,7 +37,7 @@ pub use registry::SandboxRegistry;
 /// assert!(guide.contains("error.message"));
 /// ```
 pub const SANDBOX_AGENT_GUIDE: &str = r#"
-You have access to the iii sandbox::* tools. Use them to run code in an
+You have access to the iii worker sandbox::* tools. Use them to run code in an
 isolated microVM and capture stdout/stderr.
 
 # Workflow
@@ -103,13 +103,20 @@ If detail.fix is non-null, your next call is fn(detail.fix).
 
 use std::sync::Arc;
 
-use iii_observability::OtelConfig;
-use iii_sdk::{InitOptions, RegisterFunction, WorkerMetadata, register_worker};
+use iii_helpers::observability::OtelConfig;
+use iii_sdk::runtime::WorkerMetadata;
+use iii_sdk::{InitOptions, RegisterFunction, register_worker};
 
 use crate::sandbox_daemon::config::SandboxConfig;
 use crate::sandbox_daemon::errors::SandboxErrorWire;
 
 pub async fn serve(config: SandboxConfig, engine_url: &str) -> anyhow::Result<()> {
+    // FIRST statement, before any await: snapshot spawn-time facts for the
+    // engine-death watch (see crate::daemon_exit). Without it this daemon had
+    // the same orphan leak as worker-manager-daemon — worse, an orphaned
+    // sandbox-daemon keeps live libkrun VMs around.
+    let exit_watch = crate::daemon_exit::ExitWatch::arm_at_startup();
+
     tracing::info!(url = %engine_url, "connecting to III engine");
     // Identify ourselves as `iii-sandbox` so the engine surfaces this
     // worker by its config-yaml name (and not the auto-detected
@@ -122,6 +129,10 @@ pub async fn serve(config: SandboxConfig, engine_url: &str) -> anyhow::Result<()
             otel: Some(OtelConfig::default()),
             metadata: Some(WorkerMetadata {
                 name: "iii-sandbox".to_string(),
+                description: Some(
+                    "Launch and manage isolated worker sandboxes (create, exec, stop, list)."
+                        .to_string(),
+                ),
                 ..Default::default()
             }),
             ..Default::default()
@@ -174,14 +185,20 @@ pub async fn serve(config: SandboxConfig, engine_url: &str) -> anyhow::Result<()
     }
 
     tracing::info!("sandbox-daemon ready");
-    tokio::signal::ctrl_c().await?;
-    tracing::info!("sandbox-daemon shutting down");
+    // Exit on SIGINT/SIGTERM/SIGHUP or engine death — see crate::daemon_exit.
+    // Previously this parked on bare ctrl_c(): the engine's kill_child SIGTERM
+    // killed it via default disposition, and an abnormal engine exit leaked it
+    // as a reconnect-looping orphan holding live VMs. VM teardown on exit is
+    // unchanged (the reaper/registry semantics are their own concern); this
+    // closes the daemon-leak layer.
+    let reason = exit_watch.wait("sandbox-daemon").await;
+    tracing::info!(reason, "sandbox-daemon shutting down");
     iii.shutdown_async().await;
     Ok(())
 }
 
 fn register_sandbox_create(
-    iii: &iii_sdk::III,
+    iii: &iii_sdk::IIIClient,
     registry: Arc<crate::sandbox_daemon::SandboxRegistry>,
     cfg: Arc<crate::sandbox_daemon::config::SandboxConfig>,
     launcher: Arc<crate::sandbox_daemon::adapters::IiiWorkerLauncher>,
@@ -227,7 +244,7 @@ fn register_sandbox_create(
 }
 
 fn register_sandbox_exec(
-    iii: &iii_sdk::III,
+    iii: &iii_sdk::IIIClient,
     registry: Arc<crate::sandbox_daemon::SandboxRegistry>,
     runner: Arc<crate::sandbox_daemon::adapters::ShellProtoRunner>,
 ) {
@@ -263,7 +280,7 @@ fn register_sandbox_exec(
 }
 
 fn register_sandbox_stop(
-    iii: &iii_sdk::III,
+    iii: &iii_sdk::IIIClient,
     registry: Arc<crate::sandbox_daemon::SandboxRegistry>,
     stopper: Arc<crate::sandbox_daemon::adapters::SignalStopper>,
 ) {
@@ -294,7 +311,7 @@ fn register_sandbox_stop(
 }
 
 fn register_sandbox_list(
-    iii: &iii_sdk::III,
+    iii: &iii_sdk::IIIClient,
     registry: Arc<crate::sandbox_daemon::SandboxRegistry>,
 ) {
     // Note: pre-migration this handler used
@@ -322,7 +339,7 @@ fn register_sandbox_list(
                     &result,
                     start.elapsed().as_millis() as u64,
                 );
-                Ok::<_, iii_sdk::IIIError>(result.unwrap())
+                Ok::<_, iii_sdk::Error>(result.unwrap())
             }
         })
         .description("List active sandboxes"),
@@ -330,7 +347,7 @@ fn register_sandbox_list(
 }
 
 fn register_sandbox_catalog_list(
-    iii: &iii_sdk::III,
+    iii: &iii_sdk::IIIClient,
     cfg: Arc<crate::sandbox_daemon::config::SandboxConfig>,
 ) {
     let _ = iii.register_function(
@@ -349,7 +366,7 @@ fn register_sandbox_catalog_list(
                         &result,
                         start.elapsed().as_millis() as u64,
                     );
-                    Ok::<_, iii_sdk::IIIError>(result.unwrap())
+                    Ok::<_, iii_sdk::Error>(result.unwrap())
                 }
             },
         )

@@ -4,10 +4,11 @@
 // This software is patent protected. We welcome discussions - reach out at team@iii.dev
 // See LICENSE and PATENTS files for details.
 
-//! `iii sandbox {run, create, exec, list, stop}` handlers. Thin CLI wrapper
+//! `iii worker sandbox {run, create, exec, list, stop}` handlers. Thin CLI wrapper
 //! that calls the sandbox daemon directly via `iii.trigger(TriggerRequest{...})`.
 
-use iii_sdk::{III, IIIError, InitOptions, TriggerRequest, register_worker};
+use iii_sdk::protocol::TriggerRequest;
+use iii_sdk::{Error, IIIClient, InitOptions, register_worker};
 use serde_json::{Value, json};
 
 use crate::cli::rootfs_cache;
@@ -23,8 +24,8 @@ const DAEMON_DEFAULT_EXEC_TIMEOUT_MS: u64 = 300_000;
 const EXEC_TRIGGER_MARGIN_MS: u64 = 5_000;
 
 /// Connect to the local engine on the given port. Returns the connected
-/// `III` handle; callers are responsible for `iii.shutdown()` before return.
-fn connect(port: u16) -> III {
+/// `IIIClient` handle; callers are responsible for `iii.shutdown()` before return.
+fn connect(port: u16) -> IIIClient {
     register_worker(&format!("ws://127.0.0.1:{port}"), InitOptions::default())
 }
 
@@ -76,7 +77,7 @@ async fn preflight_pull_if_preset(image: &str) {
 /// payload only has a message (or the body isn't JSON at all), the
 /// formatted string falls back to bare message / raw error display so we
 /// never strip information.
-fn handler_error_message(err: &IIIError) -> String {
+fn handler_error_message(err: &Error) -> String {
     let raw = err.to_string();
     let stripped = raw.strip_prefix("handler error: ").unwrap_or(&raw);
     let Some(brace) = stripped.find('{') else {
@@ -97,7 +98,7 @@ fn handler_error_message(err: &IIIError) -> String {
     }
 }
 
-/// `iii sandbox run <image> [--cpus N] [--memory MB] -- <cmd> [args...]`
+/// `iii worker sandbox run <image> [--cpus N] [--memory MB] -- <cmd> [args...]`
 pub async fn handle_run(image: String, cmd: Vec<String>, cpus: u32, memory: u32, port: u16) -> i32 {
     let (head, tail) = match cmd.split_first() {
         Some((h, t)) => (h.clone(), t.to_vec()),
@@ -198,8 +199,8 @@ pub async fn handle_run(image: String, cmd: Vec<String>, cpus: u32, memory: u32,
     exit_code
 }
 
-/// `iii sandbox create <image> [flags]` -- prints the sandbox id on success.
-/// The sandbox persists until `iii sandbox stop <id>` or the idle timeout
+/// `iii worker sandbox create <image> [flags]` -- prints the sandbox id on success.
+/// The sandbox persists until `iii worker sandbox stop <id>` or the idle timeout
 /// fires.
 pub async fn handle_create(
     image: String,
@@ -247,7 +248,7 @@ pub async fn handle_create(
             // On a TTY, leave a one-line "ready" breadcrumb on stderr so the
             // user sees what actually happened before the uuid appears. On a
             // pipe, stderr is silent and the uuid goes straight to stdout so
-            // `SB=$(iii sandbox create ...)` still works unchanged.
+            // `SB=$(iii worker sandbox create ...)` still works unchanged.
             if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
                 let elapsed = started_at.elapsed().as_millis() as f64 / 1000.0;
                 eprintln!("✓ sandbox ready in {elapsed:.1}s");
@@ -265,7 +266,7 @@ pub async fn handle_create(
     code
 }
 
-/// `iii sandbox exec <id> [--timeout DUR] [-e KEY=VAL]... -- <cmd> [args...]`
+/// `iii worker sandbox exec <id> [--timeout DUR] [-e KEY=VAL]... -- <cmd> [args...]`
 ///
 /// Stdin is not piped -- sandbox::exec is pipe-mode by protocol and the
 /// current wire shape only carries base64-encoded stdin as an optional
@@ -301,7 +302,7 @@ pub async fn handle_exec(
     // when absent the handler defaults to DAEMON_DEFAULT_EXEC_TIMEOUT_MS. Either
     // way we add EXEC_TRIGGER_MARGIN_MS so the daemon's own deadline fires before
     // the trigger times out, ensuring proper timed_out signalling rather than a
-    // bare IIIError::Timeout.
+    // bare Error::Timeout.
     let trigger_timeout_ms =
         Some(timeout_ms.unwrap_or(DAEMON_DEFAULT_EXEC_TIMEOUT_MS) + EXEC_TRIGGER_MARGIN_MS);
 
@@ -360,7 +361,7 @@ pub async fn handle_exec(
     exit_code
 }
 
-/// `iii sandbox list`
+/// `iii worker sandbox list`
 ///
 /// Sends an empty payload; the daemon's list handler returns every
 /// sandbox unconditionally. The `--all` flag is a silent no-op, kept
@@ -404,7 +405,7 @@ pub async fn handle_list(_all: bool, port: u16) -> i32 {
     0
 }
 
-/// `iii sandbox stop <id>`
+/// `iii worker sandbox stop <id>`
 pub async fn handle_stop(id: String, port: u16) -> i32 {
     let iii = connect(port);
 
@@ -453,7 +454,7 @@ fn engine_ws_base(port: u16) -> String {
     format!("ws://127.0.0.1:{port}")
 }
 
-/// `iii sandbox upload <SB> <LOCAL_PATH | -> <REMOTE_PATH> [--mode 0644] [--parents]`
+/// `iii worker sandbox upload <SB> <LOCAL_PATH | -> <REMOTE_PATH> [--mode 0644] [--parents]`
 pub async fn handle_upload(
     id: String,
     local_path: String,
@@ -577,14 +578,14 @@ pub async fn handle_upload(
     code
 }
 
-/// `iii sandbox download <SB> <REMOTE_PATH> <LOCAL_PATH | ->`
+/// `iii worker sandbox download <SB> <REMOTE_PATH> <LOCAL_PATH | ->`
 pub async fn handle_download(
     id: String,
     remote_path: String,
     local_path: String,
     port: u16,
 ) -> i32 {
-    use iii_sdk::{ChannelReader, StreamChannelRef};
+    use iii_sdk::channel::{ChannelReader, StreamChannelRef};
     use tokio::io::AsyncWriteExt;
 
     let iii = connect(port);
@@ -682,11 +683,11 @@ pub async fn handle_download(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iii_sdk::IIIError;
+    use iii_sdk::Error;
 
     #[test]
     fn extracts_message_from_flat_payload() {
-        let e = IIIError::Handler(
+        let e = Error::Handler(
             r#"{"type":"SandboxNotFound","code":"S002","message":"sandbox abc not found"}"#.into(),
         );
         assert_eq!(handler_error_message(&e), "[S002] sandbox abc not found");
@@ -694,9 +695,8 @@ mod tests {
 
     #[test]
     fn extracts_message_from_nested_payload() {
-        let e = IIIError::Handler(
-            r#"{"error":{"code":"S002","message":"sandbox abc not found"}}"#.into(),
-        );
+        let e =
+            Error::Handler(r#"{"error":{"code":"S002","message":"sandbox abc not found"}}"#.into());
         assert_eq!(handler_error_message(&e), "[S002] sandbox abc not found");
     }
 
@@ -705,7 +705,7 @@ mod tests {
     /// no `[None]`-style placeholder, no thrown information.
     #[test]
     fn omits_code_prefix_when_only_message_present() {
-        let e = IIIError::Handler(r#"{"message":"some other error"}"#.into());
+        let e = Error::Handler(r#"{"message":"some other error"}"#.into());
         assert_eq!(handler_error_message(&e), "some other error");
     }
 
@@ -714,7 +714,7 @@ mod tests {
     /// in stderr where shell scripts can grep for it.
     #[test]
     fn fs_trigger_payload_carries_s_code_without_doubled_prefix() {
-        let e = IIIError::Handler(
+        let e = Error::Handler(
             r#"{"type":"filesystem","code":"S211","message":"path not found: /tmp/no/such/file","retryable":false}"#
                 .into(),
         );
@@ -734,7 +734,7 @@ mod tests {
 
     #[test]
     fn falls_back_on_non_json_handler_body() {
-        let e = IIIError::Handler("bad request: missing field".into());
+        let e = Error::Handler("bad request: missing field".into());
         assert_eq!(
             handler_error_message(&e),
             "handler error: bad request: missing field"
@@ -743,7 +743,7 @@ mod tests {
 
     #[test]
     fn falls_back_on_non_handler_variant() {
-        let e = IIIError::Timeout;
+        let e = Error::Timeout;
         assert_eq!(handler_error_message(&e), "invocation timed out");
     }
 }

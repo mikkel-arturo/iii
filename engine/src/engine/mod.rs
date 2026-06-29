@@ -26,7 +26,7 @@ use crate::{
     protocol::{ErrorBody, Message},
     services::{Service, ServicesRegistry},
     telemetry::{
-        SpanExt, ingest_otlp_json, ingest_otlp_logs, ingest_otlp_metrics,
+        ingest_otlp_json, ingest_otlp_logs, ingest_otlp_metrics,
         inject_baggage_from_context, inject_traceparent_from_context,
     },
     trigger::{Trigger, TriggerRegistry, TriggerType},
@@ -468,26 +468,14 @@ impl Engine {
         baggage: &Option<String>,
         invocation_id: Option<Uuid>,
     ) {
-        // Use `with_parent_headers` (which calls `set_parent` on the
-        // still-unentered span) instead of `OtelContext::attach()` +
-        // `info_span!()`.  The `attach`-before-`info_span!` pattern only
-        // works for contextual spans (those created inside an active tracing
-        // span) because `tracing-opentelemetry`'s `parent_context()` only
-        // reads `Context::current()` when `is_contextual() == true`.  For
-        // non-contextual spans it falls through to `Context::default()` and
-        // silently ignores the attached context, creating an orphan root
-        // trace.  `set_parent` replaces the `parent_cx` in the Builder
-        // state directly and always works before the span is entered.
-        let span = tracing::info_span!(
-            "handle_invocation",
-            otel.name = %format!("handle_invocation {}", function_id),
-            worker_id = %worker.id,
-            function_id = %function_id,
-            invocation_id = %crate::logging::display_option(&invocation_id),
-            otel.kind = "server",
-            otel.status_code = tracing::field::Empty,
-        )
-        .with_parent_headers(traceparent.as_deref(), baggage.as_deref());
+        // The canonical engine span for an invocation is the `call <fn>` span
+        // opened in `InvocationHandler::handle_invocation`. We intentionally do
+        // NOT open a separate `handle_invocation` span here: it produced a
+        // redundant second engine SERVER span for every worker-initiated call
+        // (`handle_invocation <fn>` -> `call <fn>`), doubling engine span
+        // volume. A disabled span keeps the instrumented task structure intact
+        // while emitting nothing.
+        let span = tracing::Span::none();
 
         let engine = self.clone();
         let worker = worker.clone();
@@ -506,13 +494,11 @@ impl Engine {
         };
         let incoming_traceparent = traceparent.clone();
         let incoming_baggage = baggage.clone();
-        // Derive headers from the span we just opened so the downstream
-        // `call <fn>` becomes a child of `handle_invocation`, not a
-        // sibling of the original caller.
-        let downstream_traceparent =
-            inject_traceparent_from_context(&span.context()).or_else(|| traceparent.clone());
-        let downstream_baggage =
-            inject_baggage_from_context(&span.context()).or_else(|| baggage.clone());
+        // Pass the incoming caller context straight through so the downstream
+        // `call <fn>` span nests directly under the caller's span instead of an
+        // intermediate engine wrapper.
+        let downstream_traceparent = traceparent.clone();
+        let downstream_baggage = baggage.clone();
 
         tokio::spawn(
             async move {
@@ -1006,13 +992,31 @@ impl Engine {
                         let traceparent = traceparent.clone();
                         let baggage = baggage.clone();
 
-                        let span = tracing::info_span!(
-                            "enqueue_action",
-                            otel.name = %format!("enqueue {} → {}", function_id, queue),
-                            function_id = %function_id,
-                            queue = %queue,
-                        )
-                        .with_parent_headers(traceparent.as_deref(), baggage.as_deref());
+                        let span = {
+                            // Parent context must be on `Context::current()`
+                            // BEFORE span creation; `set_parent` after is too
+                            // late for `SpanProcessor::on_start`.
+                            let parent_cx = crate::telemetry::extract_context(
+                                traceparent.as_deref(),
+                                baggage.as_deref(),
+                            );
+                            // The enqueuer's baggage names the enqueuer; rewrite
+                            // `iii.function.id` to the function being enqueued so
+                            // `BaggageSpanProcessor` stamps this span with the
+                            // target, not the caller (the `fn_queue` consumer span
+                            // gets the same correction via the stored baggage).
+                            let parent_cx = crate::telemetry::with_function_id_baggage(
+                                &parent_cx,
+                                &function_id,
+                            );
+                            let _guard = parent_cx.attach();
+                            tracing::info_span!(
+                                "enqueue_action",
+                                otel.name = %format!("enqueue {} → {}", function_id, queue),
+                                function_id = %function_id,
+                                queue = %queue,
+                            )
+                        };
 
                         tokio::spawn(
                             async move {
@@ -1995,6 +1999,7 @@ mod tests {
         engine.upsert_runtime_worker(crate::worker_connections::RuntimeWorkerInfo {
             id: "iii-state".to_string(),
             name: "iii-state".to_string(),
+            description: None,
             worker_type: "iii-state".to_string(),
             connected_at: chrono::Utc::now(),
             function_ids: vec!["state::get".to_string()],

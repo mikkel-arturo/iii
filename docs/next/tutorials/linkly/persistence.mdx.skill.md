@@ -22,17 +22,16 @@ iii worker add database
 mkdir -p data
 ```
 
-The default config that the database worker ships with is below, it will work well for our purposes
-but let's modify its url to put `iii.db` in the `./data` folder.
+Adjust your database worker in `config.yaml` so that it looks like the below.
 
-<Info>The database worker will automatically create `iii.db` on first run.</Info>
+<Info>The database worker will automatically create `./data/iii.db` on first run.</Info>
 
 <Info>
   The database worker supports more than SQLite, refer to the [`database` worker
   docs](https://workers.iii.dev/workers/database) for all supported databases.
 </Info>
 
-```yaml {11} config.yaml
+```yaml {3-11} config.yaml
 workers:
   # ...
   - name: database
@@ -46,22 +45,26 @@ workers:
           url: sqlite:./data/iii.db
 ```
 
-The worker owns its schema. Build up the changes to `link/src/index.ts` in pieces.
+The worker will be in charge of defining its own schema. We'll build up the necessary changes to
+`link/src/index.ts` in pieces.
 
-First add the `DB` constant near the top of the file:
+### Define the database
 
-```typescript {3} src/index.ts
-import { registerWorker, Logger } from "iii-sdk";
+First add the `DB` constant **near the top of `link/src/index.ts`**:
 
-const DB = "primary";
+```typescript {4} src/index.ts
+import { registerWorker } from "iii-sdk";
+import { Logger } from "@iii-dev/helpers/observability";
+
+const DB = "primary"; // Matches db name in config.yaml
 ```
 
-## Make link storage persistent
+### Make link storage persistent
 
 Now we're going to adapt the existing `link::create` and `link::resolve` functions so that they
 write and read from our new database while using our state worker as a hot cache.
 
-### Create a schema
+#### Create a schema
 
 Add an `ensureSchema()` function at the end of `link/src/index.ts` that creates both tables on
 startup. The database worker accepts SQL through its `database::execute` function:
@@ -89,9 +92,10 @@ ensureSchema()
   .catch((err) => logger.error("database: schema init failed", { error: String(err) }));
 ```
 
-### Setup database writing
+#### Setup database writing
 
-Change `link::create` to write to both the database (durable record) and `iii-state` (hot cache):
+**Modify `link::create`** to write to both the database (durable record) and `iii-state` (hot
+cache):
 
 ```typescript src/index.ts {4-11}
 worker.registerFunction("link::create", async (payload: { url: string; code?: string }) => {
@@ -114,11 +118,11 @@ worker.registerFunction("link::create", async (payload: { url: string; code?: st
 });
 ```
 
-### Setup database retrieval
+#### Setup database retrieval
 
-Change `link::resolve` to check the cache first; on a miss, fall back to the database and warm the
-cache for the next read. It's easiest to replace the existing `link::resolve` function with our new
-version:
+**Modify `link::resolve` to check the cache first**; on a miss, fall back to the database and warm
+the cache for the next read. It's easiest to replace the existing `link::resolve` function with our
+new version:
 
 ```typescript src/index.ts
 worker.registerFunction("link::resolve", async (payload: { code: string }) => {
@@ -151,9 +155,9 @@ worker.registerFunction("link::resolve", async (payload: { code: string }) => {
 
 ## Add click tracking
 
-Since we have a database now, you can start click tracking. Pull the write into its own
-`link::record_click` function so the redirect records a click instead of issuing SQL itself, and so
-the next chapter can move that work onto a queue without touching the redirect's logic. Add it below
+Since we have a database now, you can start click tracking. Make a new function
+(`link::record_click`) to do that and save it to the database. The next chapter will move this
+work onto a queue so that it can run without touching the redirect's logic. Add it below
 `link::resolve`:
 
 ```typescript src/index.ts
@@ -173,9 +177,11 @@ worker.registerFunction(
 );
 ```
 
-Now update `http::redirect` to trigger it directly, right before returning the redirect:
+### Update `http::redirect` to call `link::record_click`
 
-```typescript src/index.ts {14-17}
+**Now update `http::redirect` to trigger it directly**, right before returning the redirect:
+
+```typescript src/index.ts {14-18}
 worker.registerFunction("http::redirect", async (req) => {
   const code = req.path_params.code;
   const { url } = await worker.trigger<{ code: string }, { url: string | null }>({
@@ -189,6 +195,7 @@ worker.registerFunction("http::redirect", async (req) => {
       headers: { "Content-Type": "application/json" },
     };
   }
+  // This Trigger is slow because it waits on link::record_click's completion, we'll move its work to a queue soon
   await worker.trigger({
     function_id: "link::record_click",
     payload: { code, clicked_at: new Date().toISOString() },
@@ -199,10 +206,13 @@ worker.registerFunction("http::redirect", async (req) => {
 
 <Note>
   The database write for clicks adds latency to every redirect. The next chapter moves it onto a
-  durable queue that removes the latency and while adding recovery from database failures.
+  durable queue that removes the latency while also adding recovery from database failures.
 </Note>
 
-Save the file, create a link, and follow it a few times:
+### Try the click tracking
+
+Now let's see the click tracking in action. Save the file, create a link, and simulate clicking it a
+few times:
 
 ```bash
 curl -s -X POST http://127.0.0.1:3111/links \
@@ -217,10 +227,28 @@ iii trigger database::query db=primary sql="SELECT COUNT(*) AS clicks FROM click
 ```
 
 ```json
-{ "rows": [{ "clicks": 3 }], "row_count": 1 }
+{
+  "columns": [
+    {
+      "name": "clicks",
+      "type": ""
+    }
+  ],
+  "row_count": 1,
+  "rows": [
+    {
+      "clicks": 3
+    }
+  ]
+}
 ```
 
 ## Conclusion
+
+<Info>
+  Did you know that `--help` works with function id's as well? Try running: `iii trigger
+  database::query --help` to see what arguments `database::query` accepts.
+</Info>
 
 Linkly's links are now durable: the database is the source of truth, `iii-state` keeps lookups fast,
 and every redirect appends a timestamped row to the `clicks` table. But that row is written on the

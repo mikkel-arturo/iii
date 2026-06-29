@@ -15,6 +15,7 @@ pub enum WorkerOpErrorKind {
     LocalPathNotAllowedViaTrigger, // W102
     MissingTarget,                 // W103
     ConsentRequired,               // W104
+    BadRequest,                    // W105
     NotFound,                      // W110
     AlreadyExists,                 // W111
     NotInstalled,                  // W112
@@ -47,6 +48,7 @@ impl WorkerOpErrorKind {
             Self::LocalPathNotAllowedViaTrigger => "W102",
             Self::MissingTarget => "W103",
             Self::ConsentRequired => "W104",
+            Self::BadRequest => "W105",
             Self::NotFound => "W110",
             Self::AlreadyExists => "W111",
             Self::NotInstalled => "W112",
@@ -78,9 +80,15 @@ pub enum WorkerOpError {
     #[error("invalid worker name {name:?}: {reason}")]
     InvalidName { name: String, reason: String },
 
+    /// Reserved. No production path constructs this since malformed
+    /// payloads moved to `BadRequest` (W105); kept for wire-code stability
+    /// because W101 is documented as a published code.
     #[error("invalid worker source {input:?}: {reason}")]
     InvalidSource { input: String, reason: String },
 
+    /// Reserved. Local-path installs are now permitted over the trigger
+    /// surface, so this is no longer constructed by any production path.
+    /// Kept for wire-code stability because W102 is a published code.
     #[error("local path {path:?} is not allowed via the worker::* trigger surface")]
     LocalPathNotAllowedViaTrigger { path: String },
 
@@ -89,6 +97,9 @@ pub enum WorkerOpError {
 
     #[error("{op:?} requires confirmation: pass yes:true")]
     ConsentRequired { op: String },
+
+    #[error("invalid payload for {function_id:?}: {reason}")]
+    BadRequest { function_id: String, reason: String },
 
     #[error("worker {name:?} not found")]
     NotFound { name: String },
@@ -105,8 +116,15 @@ pub enum WorkerOpError {
     #[error("worker {name:?} is already running (pid {pid})")]
     AlreadyRunning { name: String, pid: u32 },
 
-    #[error("project lock busy{}", match holder_pid { Some(p) => format!(" (held by pid {})", p), None => String::new() })]
-    LockBusy { holder_pid: Option<u32> },
+    #[error("{}", lock_busy_message(holder_pid, *holder_is_self))]
+    LockBusy {
+        holder_pid: Option<u32>,
+        /// True when the lock holder is THIS process — i.e. another worker
+        /// operation is already running in the same worker-ops daemon.
+        /// Surfaced so callers (especially LLMs) don't "fix" a busy lock by
+        /// killing the holder pid, which kills the daemon serving worker::*.
+        holder_is_self: bool,
+    },
 
     #[error("lock I/O failed at {path:?}: {source}")]
     LockIo {
@@ -183,6 +201,30 @@ pub enum WorkerOpError {
     Internal { message: String },
 }
 
+/// W120 message, written for the caller who has to decide what to do next —
+/// including LLM callers whose instinct on "lock held by pid N" is to kill
+/// pid N. In a real session that pid was the worker-ops daemon itself (an
+/// in-flight `worker::add` held the project flock), and killing it took the
+/// whole worker::* API down. Say what the holder is and forbid the footgun.
+fn lock_busy_message(holder_pid: &Option<u32>, holder_is_self: bool) -> String {
+    match (holder_pid, holder_is_self) {
+        (Some(p), true) => format!(
+            "project lock busy: another worker operation is already running in this \
+             worker-ops daemon (pid {p}). The lock clears when that operation finishes — \
+             retry shortly, or poll worker::status / worker::list. Do NOT kill pid {p}: \
+             it is the daemon serving the worker::* API."
+        ),
+        (Some(p), false) => format!(
+            "project lock busy (held by pid {p}, likely an in-flight worker operation). \
+             The lock dies with that process, so a crashed holder never strands it — \
+             just retry shortly. Do NOT kill pid {p} to free the lock."
+        ),
+        (None, _) => "project lock busy; an in-flight worker operation holds it. \
+             Retry shortly."
+            .to_string(),
+    }
+}
+
 impl WorkerOpError {
     pub fn kind(&self) -> WorkerOpErrorKind {
         use WorkerOpErrorKind as K;
@@ -192,6 +234,7 @@ impl WorkerOpError {
             Self::LocalPathNotAllowedViaTrigger { .. } => K::LocalPathNotAllowedViaTrigger,
             Self::MissingTarget { .. } => K::MissingTarget,
             Self::ConsentRequired { .. } => K::ConsentRequired,
+            Self::BadRequest { .. } => K::BadRequest,
             Self::NotFound { .. } => K::NotFound,
             Self::AlreadyExists { .. } => K::AlreadyExists,
             Self::NotInstalled { .. } => K::NotInstalled,
@@ -229,12 +272,29 @@ impl WorkerOpError {
             Self::LocalPathNotAllowedViaTrigger { path } => json!({ "path": path }),
             Self::MissingTarget { op, reason } => json!({ "op": op, "reason": reason }),
             Self::ConsentRequired { op } => json!({ "op": op }),
+            Self::BadRequest {
+                function_id,
+                reason,
+            } => {
+                json!({
+                    "function_id": function_id,
+                    "reason": reason,
+                    // LLM/automation recovery path: the request schema is one
+                    // call away and names every required field.
+                    "hint": format!(
+                        "call worker::schema {{ \"function_id\": {function_id:?} }} for the request schema"
+                    ),
+                })
+            }
             Self::NotFound { name }
             | Self::AlreadyExists { name }
             | Self::NotInstalled { name }
             | Self::NotRunning { name } => json!({ "name": name }),
             Self::AlreadyRunning { name, pid } => json!({ "name": name, "pid": pid }),
-            Self::LockBusy { holder_pid } => json!({ "holder_pid": holder_pid }),
+            Self::LockBusy {
+                holder_pid,
+                holder_is_self,
+            } => json!({ "holder_pid": holder_pid, "holder_is_self": holder_is_self }),
             Self::LockIo { path, .. } => json!({ "path": path.display().to_string() }),
             Self::ConfigIo { path, .. } => json!({ "path": path.display().to_string() }),
             Self::ConfigParse { path, message } => {
@@ -329,6 +389,46 @@ mod tests {
         assert_eq!(err.to_payload()["code"], "W102");
     }
 
+    // W120 messages must steer the caller away from killing the lock holder
+    // — a real LLM session killed the worker-ops daemon to "free" the lock,
+    // taking the whole worker::* API down.
+    #[test]
+    fn lock_busy_self_holder_names_the_daemon_and_forbids_kill() {
+        let err = WorkerOpError::LockBusy {
+            holder_pid: Some(4242),
+            holder_is_self: true,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("worker-ops daemon"), "got: {msg}");
+        assert!(msg.contains("Do NOT kill pid 4242"), "got: {msg}");
+        assert!(msg.contains("worker::status"), "got: {msg}");
+        let payload = err.to_payload();
+        assert_eq!(payload["code"], "W120");
+        assert_eq!(payload["details"]["holder_pid"], 4242);
+        assert_eq!(payload["details"]["holder_is_self"], true);
+    }
+
+    #[test]
+    fn lock_busy_foreign_holder_still_warns_against_kill() {
+        let err = WorkerOpError::LockBusy {
+            holder_pid: Some(99),
+            holder_is_self: false,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("Do NOT kill pid 99"), "got: {msg}");
+        assert!(msg.contains("retry"), "got: {msg}");
+        assert_eq!(err.to_payload()["details"]["holder_is_self"], false);
+    }
+
+    #[test]
+    fn lock_busy_unknown_holder_has_guidance() {
+        let err = WorkerOpError::LockBusy {
+            holder_pid: None,
+            holder_is_self: false,
+        };
+        assert!(err.to_string().contains("Retry shortly"));
+    }
+
     #[test]
     fn missing_target_is_w103() {
         let err = WorkerOpError::MissingTarget {
@@ -383,6 +483,27 @@ mod tests {
         let payload = err.to_payload();
         assert_eq!(payload["code"], "W170");
         assert_eq!(payload["details"], json!({}));
+    }
+
+    #[test]
+    fn bad_request_payload_carries_function_id_and_schema_hint() {
+        let err = WorkerOpError::BadRequest {
+            function_id: "worker::add".into(),
+            reason: "missing field `source`".into(),
+        };
+        let payload = err.to_payload();
+        assert_eq!(payload["code"], "W105");
+        assert_eq!(payload["details"]["function_id"], "worker::add");
+        assert_eq!(payload["details"]["reason"], "missing field `source`");
+        let hint = payload["details"]["hint"].as_str().unwrap();
+        assert!(
+            hint.contains("worker::schema") && hint.contains("worker::add"),
+            "hint must point the caller at worker::schema for this function: {hint}"
+        );
+        assert!(
+            err.to_string().starts_with("invalid payload for"),
+            "BadRequest must not reuse InvalidSource's 'invalid worker source' stem"
+        );
     }
 
     #[test]

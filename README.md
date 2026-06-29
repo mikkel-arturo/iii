@@ -2,12 +2,40 @@
 
 ![iii: point-to-point integrations vs zero-integration via shared runtime](.github/assets/zero-integration.png)
 
-[![Engine License](https://img.shields.io/badge/engine-ELv2-blue.svg)](engine/LICENSE)
-[![SDK License](https://img.shields.io/badge/sdk-Apache--2.0-green.svg)](sdk/LICENSE)
-[![Docker](https://img.shields.io/docker/v/iiidev/iii?label=docker)](https://hub.docker.com/r/iiidev/iii)
-[![npm](https://img.shields.io/npm/v/iii-sdk?label=npm)](https://www.npmjs.com/package/iii-sdk)
-[![PyPI](https://img.shields.io/pypi/v/iii-sdk?label=pypi)](https://pypi.org/project/iii-sdk/)
-[![Crates.io](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fcrates.io%2Fapi%2Fv1%2Fcrates%2Fiii-sdk&query=%24.crate.max_stable_version&label=crates.io&prefix=v&color=orange)](https://crates.io/crates/iii-sdk)
+<p align="center">
+<a href="https://trendshift.io/repositories/22583?utm_source=repository-badge&amp;utm_medium=badge&amp;utm_campaign=badge-repository-22583" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/repositories/22583" alt="iii-hq%2Fiii | Trendshift" width="250" height="55"/></a>
+</p>
+
+
+<!-- Release -->
+<p align="center">
+  <a href="https://hub.docker.com/r/iiidev/iii"><img src="https://img.shields.io/docker/v/iiidev/iii?label=docker" alt="Docker"></a>
+  <a href="https://www.npmjs.com/package/iii-sdk"><img src="https://img.shields.io/npm/v/iii-sdk?label=npm" alt="npm"></a>
+  <a href="https://pypi.org/project/iii-sdk/"><img src="https://img.shields.io/pypi/v/iii-sdk?label=pypi" alt="PyPI"></a>
+  <a href="https://crates.io/crates/iii-sdk"><img src="https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fcrates.io%2Fapi%2Fv1%2Fcrates%2Fiii-sdk&query=%24.crate.max_stable_version&label=crates.io&prefix=v&color=orange" alt="Crates.io"></a>
+  <a href="https://discord.gg/iiidev"><img src="https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white" alt="Discord"></a>
+</p>
+
+<!-- Downloads -->
+<p align="center">
+  <a href="https://workers.iii.dev/"><img src="https://workers.iii.dev/badge/downloads.svg" alt="Worker downloads"></a>
+  <a href="https://workers.iii.dev/"><img src="https://workers.iii.dev/badge/weekly.svg" alt="Weekly worker downloads"></a>
+  <a href="https://hub.docker.com/r/iiidev/iii"><img src="https://img.shields.io/docker/pulls/iiidev/iii?label=docker%20pulls&color=2496ed" alt="Docker pulls"></a>
+  <a href="https://www.npmjs.com/package/iii-sdk"><img src="https://img.shields.io/npm/dt/iii-sdk?label=npm%20downloads&color=cb3837" alt="npm downloads"></a>
+  <a href="https://pepy.tech/projects/iii-sdk"><img src="https://static.pepy.tech/personalized-badge/iii-sdk?period=total&units=international_system&left_color=grey&right_color=blue&left_text=pypi%20downloads" alt="PyPI downloads"></a>
+  <a href="https://crates.io/crates/iii-sdk"><img src="https://img.shields.io/crates/d/iii-sdk?label=crates.io%20downloads&color=e6a04c" alt="Crates.io downloads"></a>
+</p>
+
+<!-- Index -->
+<p align="center">
+  <a href="#what-is-iii">What is iii?</a> ·
+  <a href="#quick-start">Quick Start</a> ·
+  <a href="#add-workers">Add Workers</a> ·
+  <a href="#sdks">SDKs</a> ·
+  <a href="#agent-skills">Agent Skills</a> ·
+  <a href="#console">Console</a> ·
+  <a href="#resources">Resources</a>
+</p>
 
 ## What is iii?
 
@@ -79,14 +107,21 @@ trace.
   <img src=".github/assets/iii-intro-preview.gif" alt="Watch the iii intro (click to play)" width="720"/>
 </a>
 
+Install `iii`:
+
+```bash
+curl -fsSL https://install.iii.dev/iii/main/install.sh | sh
+```
+
+Then scaffold and start a project:
+
 ```bash
 iii project init myapp    # scaffold a project
 cd myapp
 iii                       # start the engine
 ```
 
-Need to install `iii` first? Full walkthrough at the
-[Quickstart guide](https://iii.dev/docs/quickstart).
+Full walkthrough at the [Quickstart guide](https://iii.dev/docs/quickstart).
 
 ## Add Workers
 
@@ -101,17 +136,32 @@ Install new capabilities into a project with `iii worker add`:
 | Node.js  | [`iii-sdk`](https://www.npmjs.com/package/iii-sdk) | `pnpm add iii-sdk` or `npm install iii-sdk` |
 | Python   | [`iii-sdk`](https://pypi.org/project/iii-sdk/)     | `pip install iii-sdk`                       |
 | Rust     | [`iii-sdk`](https://crates.io/crates/iii-sdk)      | Add to `Cargo.toml`                         |
+| Go       | [`iii-sdk`](sdk/packages/go/iii)                       | `go get github.com/iii-hq/iii/sdk/packages/go/iii` |
 
 ## Agent Skills
 
-Install iii's agent-readable reference material:
+Install iii's agent-readable reference material for the engine primitives:
 
 ```bash
 npx skills add iii-hq/iii/skills
 ```
 
-Skills cover every iii primitive: HTTP endpoints, queues, cron, state, streams, custom triggers, and
+These cover every iii primitive: HTTP endpoints, queues, cron, state, streams, custom triggers, and
 more. See [skills/](skills/) for the full list.
+
+Each worker in [iii-hq/workers](https://github.com/iii-hq/workers) also ships its own skill. Install
+them alongside the worker itself:
+
+```bash
+npx skills add iii-hq/workers --list        # list available worker skills
+npx skills add iii-hq/workers --skill database # one worker
+npx skills add iii-hq/workers --all         # every worker skill
+```
+
+The engine's built-in workers (`iii-queue`, `iii-state`, `iii-pubsub`, `iii-stream`, `iii-cron`,
+`iii-http`, `iii-observability`, `iii-bridge`, `iii-exec`, `configuration`) ship their skills in
+this repo. Install one with `npx skills add iii-hq/iii --full-depth --skill <name>`; each worker's README under
+[`engine/src/workers/`](engine/src/workers/) lists the exact `iii worker add` and skill command.
 
 ## Console
 
@@ -124,7 +174,7 @@ triggers, queues, traces, logs, and real-time state. See the
 | Directory  | What it is                                              | README                                 |
 | ---------- | ------------------------------------------------------- | -------------------------------------- |
 | `engine/`  | iii Engine (Rust) - core runtime, modules, and protocol | [engine/README.md](engine/README.md)   |
-| `sdk/`     | SDKs for Node.js, Python, and Rust                      | [sdk/README.md](sdk/README.md)         |
+| `sdk/`     | SDKs for Node.js, Python, Rust, and Go                  | [sdk/README.md](sdk/README.md)         |
 | `console/` | Developer console (React + Rust)                        | [console/README.md](console/README.md) |
 | `skills/`  | Agent-readable reference material                       | [skills/README.md](skills/README.md)   |
 | `website/` | iii website                                             | [website/](website/)                   |
@@ -143,6 +193,18 @@ See the [Quickstart guide](https://iii.dev/docs/quickstart) for step-by-step tut
 - [Console](console/)
 - [Examples](https://github.com/iii-hq/iii-examples)
 - [Contributing](CONTRIBUTING.md)
+
+## Star History
+
+<p align="center">
+  <a href="https://www.star-history.com/?repos=iii-hq%2Fiii&type=date&legend=top-left">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=iii-hq/iii&type=date&theme=dark&legend=bottom-right" />
+      <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=iii-hq/iii&type=date&legend=bottom-right" />
+      <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=iii-hq/iii&type=date&legend=bottom-right" />
+    </picture>
+  </a>
+</p>
 
 ## License
 

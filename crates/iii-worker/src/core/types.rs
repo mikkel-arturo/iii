@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[schemars(
-    description = "Where to fetch the worker from. Use `registry` for the public iii worker registry, `oci` for an arbitrary container image, or `local` for a developer machine path (CLI-only; rejected via trigger with W102)."
+    description = "Where to fetch the worker from. Use `registry` for the public iii worker registry, `oci` for an arbitrary container image, or `local` for a filesystem path on the engine/daemon host (works over the trigger too; the path is resolved on the host, not the caller)."
 )]
 pub enum WorkerSource {
     Registry {
@@ -27,14 +27,14 @@ pub enum WorkerSource {
     },
     Local {
         #[schemars(
-            description = "Local filesystem path. Trigger surface rejects this with W102; CLI-only."
+            description = "Path to a worker PROJECT DIRECTORY on the engine/daemon host (NOT the caller's machine), e.g. \"/srv/workers/my-worker\". The directory MUST contain an `iii.worker.yaml` manifest.\n\nMinimal manifest (just name + how to start):\n  name: my-worker\n  scripts:\n    start: \"node src/index.js\"\n\nAll iii.worker.yaml fields:\n  name        (required) worker id; must be a single path segment (alphanumerics, '-', '_', '.').\n  description (optional) one-line human/LLM-readable summary.\n  scripts.start   (required unless inferred) command that runs the worker process.\n  scripts.setup   (optional) one-time host provisioning, e.g. \"apt-get install -y build-essential\".\n  scripts.install (optional) dependency install, e.g. \"npm install\".\n  dependencies    (optional) map of other-worker-name -> semver range, e.g. { iii-state: \"^0.19\" }.\n  resources.cpus   (optional) integer vCPUs, default 2.\n  resources.memory (optional) MiB, default 2048.\n  env             (optional) string->string vars injected into the worker (III_URL/III_ENGINE_URL are set by the engine and ignored here).\n  runtime.base_image (optional) OCI rootfs override, e.g. \"oven/bun:1\".\n\nUnknown keys are rejected at add time. The setup/install/start scripts run on the host. Works over the trigger as well as the CLI. Dry-run a manifest with `worker::validate`; fetch the full manifest JSON Schema via `worker::schema { function_id: \"iii.worker.yaml\" }`."
         )]
         path: PathBuf,
     },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[schemars(example = "add_options_example")]
+#[schemars(example = "add_options_example", example = "add_options_local_example")]
 pub struct AddOptions {
     #[schemars(description = "Where the worker comes from (registry/oci/local).")]
     pub source: WorkerSource,
@@ -50,7 +50,7 @@ pub struct AddOptions {
     pub reset_config: bool,
     #[serde(default = "default_wait")]
     #[schemars(
-        description = "Block until the worker reports ready. Default true. Set false to return immediately after install."
+        description = "Block until the worker reports ready. Default true. Over the trigger surface installs routinely exceed bus invocation timeouts (npm install etc.) — prefer wait:false and poll worker::status. If a wait:true call times out, the install KEEPS RUNNING server-side: do not re-issue blindly (the project lock will be busy, W120); poll worker::status instead."
     )]
     pub wait: bool,
 }
@@ -60,6 +60,16 @@ fn add_options_example() -> serde_json::Value {
         "source": {"kind": "registry", "name": "pdfkit", "version": "1.0.0"},
         "force": false,
         "reset_config": false,
+        "wait": true
+    })
+}
+
+/// Second example so introspecting LLMs see the local-path shape, not just
+/// the registry one — the directory must hold an iii.worker.yaml (see the
+/// `WorkerSource::Local` field description for the manifest fields).
+fn add_options_local_example() -> serde_json::Value {
+    serde_json::json!({
+        "source": {"kind": "local", "path": "/srv/workers/my-worker"},
         "wait": true
     })
 }
@@ -212,6 +222,128 @@ pub struct ListOptions {
 
 fn list_options_example() -> serde_json::Value {
     serde_json::json!({"running_only": false})
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(example = "logs_options_example")]
+pub struct LogsOptions {
+    #[schemars(description = "Worker whose logs to read, e.g. \"pdfkit\".")]
+    pub name: String,
+    #[serde(default = "default_logs_tail")]
+    #[schemars(
+        description = "Trailing lines to return per stream. Default 100, capped at 1000. Only the last 1 MiB of each log file is scanned."
+    )]
+    pub tail: usize,
+    #[serde(default)]
+    #[schemars(
+        description = "Return raw log lines including ANSI color codes and spinner redraw frames. Default false: terminal escape sequences are stripped and spinner-only frames dropped, which is what automation/LLM callers want."
+    )]
+    pub raw: bool,
+}
+
+fn default_logs_tail() -> usize {
+    100
+}
+
+fn logs_options_example() -> serde_json::Value {
+    serde_json::json!({"name": "pdfkit", "tail": 100})
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct LogsOutcome {
+    #[schemars(description = "Worker whose logs were read.")]
+    pub name: String,
+    #[schemars(
+        description = "Host directory the logs were read from. Null when the worker has no log directory yet (never started on this host, or logs were cleared)."
+    )]
+    pub logs_dir: Option<String>,
+    #[schemars(description = "Trailing stdout lines — the worker/guest console stream.")]
+    pub stdout: Vec<String>,
+    #[schemars(
+        description = "Trailing stderr lines — host-side boot/runtime messages; during startup these chronologically precede stdout."
+    )]
+    pub stderr: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(example = "status_options_example")]
+pub struct StatusOptions {
+    #[schemars(
+        description = "Worker to inspect, e.g. \"pdfkit\". Use worker::list for the full roster."
+    )]
+    pub name: String,
+}
+
+fn status_options_example() -> serde_json::Value {
+    serde_json::json!({"name": "pdfkit"})
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[schemars(
+    description = "One worker's install/runtime status plus a recent sanitized log tail and a next-step hint. The poll target after worker::add { wait: false } (or after a wait:true call hit a bus timeout — the install continues server-side)."
+)]
+pub struct StatusOutcome {
+    #[schemars(description = "Worker name inspected.")]
+    pub name: String,
+    #[schemars(
+        description = "True when the worker is declared in the project config.yaml (i.e. worker::add completed its config write)."
+    )]
+    pub installed: bool,
+    #[schemars(
+        description = "How the worker is provisioned: \"oci\" | \"local\" | \"binary\" | \"bundle\" | \"builtin\" (config-only/engine builtin) | \"not-installed\"."
+    )]
+    pub worker_type: String,
+    #[schemars(
+        description = "True when the worker's process is alive (or, for engine builtins, when the engine itself is running). False during install/boot AND after a crash — check stderr_tail to tell which."
+    )]
+    pub running: bool,
+    #[schemars(
+        description = "Worker process pid when one is observable; null for engine builtins."
+    )]
+    pub pid: Option<u32>,
+    #[schemars(description = "Installed version from iii.lock; null when not lockfile-tracked.")]
+    pub version: Option<String>,
+    #[schemars(description = "Host log directory, when any logs exist yet.")]
+    pub logs_dir: Option<String>,
+    #[schemars(
+        description = "Last stderr lines (terminal escapes stripped) — host-side boot/install progress and errors live here (e.g. npm install failures)."
+    )]
+    pub stderr_tail: Vec<String>,
+    #[schemars(
+        description = "Last stdout lines (terminal escapes stripped) — the worker/guest console."
+    )]
+    pub stdout_tail: Vec<String>,
+    #[schemars(
+        description = "Suggested next step derived from the state above (e.g. retry guidance, which trigger to call). Advisory, not machine-stable."
+    )]
+    pub hint: String,
+}
+
+/// Reject names that could escape the per-worker directories these names
+/// are joined into (`~/.iii/logs/<name>`, `~/.iii/workers/<name>`, …).
+pub fn validate_worker_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("Worker name cannot be empty".into());
+    }
+    if name.contains("..") {
+        return Err(format!("Worker name '{}' contains '..' sequence", name));
+    }
+    if name.starts_with('.') {
+        return Err(format!(
+            "Worker name '{}' cannot start with '.' (reserved for internal control directories)",
+            name
+        ));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        return Err(format!(
+            "Worker name '{}' contains invalid characters. Only alphanumeric, dash, underscore, and dot are allowed.",
+            name
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

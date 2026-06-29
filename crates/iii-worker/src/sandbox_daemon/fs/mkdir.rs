@@ -85,7 +85,7 @@ pub async fn handle_mkdir<R: FsRunner + ?Sized>(
 }
 
 pub(super) fn register(
-    iii: &iii_sdk::III,
+    iii: &iii_sdk::IIIClient,
     registry: Arc<SandboxRegistry>,
     runner: Arc<dyn FsRunner>,
 ) {
@@ -158,6 +158,7 @@ mod tests {
             workdir: PathBuf::from("/tmp/w"),
             shell_sock: PathBuf::from("/tmp/s"),
             vm_pid: Some(1),
+            lifeline: None,
             created_at: Instant::now(),
             last_exec_at: Instant::now(),
             exec_in_progress: false,

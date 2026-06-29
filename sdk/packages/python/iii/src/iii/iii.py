@@ -14,11 +14,19 @@ from importlib.metadata import version
 from typing import Any, Awaitable, Callable, Coroutine, TypeVar, cast
 
 import websockets
-from iii_observability import OtelConfig
+from iii_helpers.http import HttpInvocationConfig
+from iii_helpers.observability import OtelConfig
+from iii_helpers.stream import (
+    StreamDeleteInput,
+    StreamGetInput,
+    StreamListGroupsInput,
+    StreamListInput,
+    StreamSetInput,
+)
 from websockets.asyncio.client import ClientConnection
 
 from .channels import ChannelReader, ChannelWriter
-from .errors import IIIInvocationError, IIITimeoutError, _wrap_wire_error
+from .errors import InvocationError, _wrap_wire_error
 from .format_utils import extract_request_format, extract_response_format
 from .iii_constants import (
     DEFAULT_RECONNECTION_CONFIG,
@@ -28,7 +36,6 @@ from .iii_constants import (
     InitOptions,
 )
 from .iii_types import (
-    HttpInvocationConfig,
     InvocationResultMessage,
     InvokeFunctionMessage,
     MessageType,
@@ -47,14 +54,7 @@ from .iii_types import (
     UnregisterTriggerMessage,
     UnregisterTriggerTypeMessage,
 )
-from .stream import (
-    IStream,
-    StreamDeleteInput,
-    StreamGetInput,
-    StreamListGroupsInput,
-    StreamListInput,
-    StreamSetInput,
-)
+from .stream import IStream
 from .triggers import Trigger, TriggerConfig, TriggerHandler, TriggerTypeRef
 from .types import Channel, RemoteFunctionData, RemoteTriggerTypeData, is_channel_ref
 
@@ -83,7 +83,7 @@ def _detect_project_name(cwd: str | None = None) -> str | None:
     when both signals are unavailable (e.g. cwd is the filesystem root, or
     the Python runtime has no TOML parser and no readable cwd basename).
 
-    No directory walking — only inspects ``cwd`` itself, so the SDK never
+    No directory walking, only inspects ``cwd`` itself, so the SDK never
     reads files outside the user's explicit working directory.
     """
     try:
@@ -142,7 +142,7 @@ class III:
 
     Examples:
         >>> from iii import register_worker, InitOptions
-        >>> iii = register_worker('ws://localhost:49134', InitOptions(worker_name='my-worker'))
+        >>> worker = register_worker('ws://localhost:49134', InitOptions(worker_name='my-worker'))
     """
 
     def __init__(self, address: str, options: InitOptions | None = None) -> None:
@@ -207,9 +207,9 @@ class III:
         instance must not be reused.
 
         Examples:
-            >>> iii = register_worker('ws://localhost:49134')
+            >>> worker = register_worker('ws://localhost:49134')
             >>> # ... do work ...
-            >>> iii.shutdown()
+            >>> worker.shutdown()
         """
         self._run_on_loop(self.shutdown_async())
         self._loop.call_soon_threadsafe(self._loop.stop)
@@ -224,7 +224,7 @@ class III:
         from an async context.
         """
         self._running = True
-        from iii_observability.telemetry import attach_event_loop, init_otel
+        from iii_helpers.observability.telemetry import attach_event_loop, init_otel
 
         loop = asyncio.get_running_loop()
         otel_cfg: OtelConfig | None = None
@@ -247,9 +247,9 @@ class III:
         instance must not be reused.
 
         Examples:
-            >>> iii = register_worker('ws://localhost:49134')
+            >>> worker = register_worker('ws://localhost:49134')
             >>> # ... do work ...
-            >>> await iii.shutdown_async()
+            >>> await worker.shutdown_async()
         """
         self._running = False
 
@@ -265,7 +265,7 @@ class III:
         for invocation_id, pending in list(self._pending.items()):
             if not pending.future.done():
                 pending.future.set_exception(
-                    IIIInvocationError(
+                    InvocationError(
                         code="SHUTDOWN",
                         message="iii is shutting down",
                         function_id=pending.function_id,
@@ -280,7 +280,7 @@ class III:
 
         self._set_connection_state("disconnected")
 
-        from iii_observability.telemetry import shutdown_otel_async
+        from iii_helpers.observability.telemetry import shutdown_otel_async
 
         await shutdown_otel_async()
 
@@ -482,6 +482,7 @@ class III:
 
     async def _invoke_with_otel_context(
         self,
+        function_id: str,
         handler: Callable[[Any], Awaitable[Any]],
         data: Any,
         traceparent: str | None,
@@ -501,7 +502,7 @@ class III:
         tracer = trace.get_tracer("iii-python-sdk")
         import os
 
-        from iii_observability import redact_and_truncate, resolve_max_bytes_from_env
+        from iii_helpers.observability import redact_and_truncate, resolve_max_bytes_from_env
 
         trace_payloads = os.environ.get("III_DISABLE_TRACE_PAYLOADS", "").lower() not in (
             "1",
@@ -509,10 +510,16 @@ class III:
         )
         payload_max_bytes = resolve_max_bytes_from_env()
 
+        # INTERNAL and named `execute` (not `call`/`trigger`): the engine
+        # already emits the SERVER `call <fn>` span for this hop AND a
+        # `trigger <fn>` span from fire_triggers. Reusing either name would
+        # duplicate an engine span under the worker's service. `execute` is
+        # unique, so the worker handler span reads as a clean internal child
+        # of the engine's call span (and is collapsible by a single rule).
         with tracer.start_as_current_span(
-            f"call {handler.__name__}",
+            f"execute {function_id}",
             context=parent_ctx,
-            kind=trace.SpanKind.SERVER,
+            kind=trace.SpanKind.INTERNAL,
         ) as span:
             if trace_payloads and span.is_recording():
                 input_json, input_truncated = redact_and_truncate(data, payload_max_bytes)
@@ -620,7 +627,7 @@ class III:
         if not invocation_id:
             task = asyncio.create_task(
                 self._invoke_with_otel_context(
-                    func.handler, resolved_data, traceparent, baggage
+                    path, func.handler, resolved_data, traceparent, baggage
                 )
             )
             task.add_done_callback(self._log_task_exception)
@@ -628,6 +635,7 @@ class III:
 
         try:
             result, response_traceparent = await self._invoke_with_otel_context(
+                path,
                 func.handler,
                 resolved_data,
                 traceparent,
@@ -792,7 +800,7 @@ class III:
             ``register_function`` methods.
 
         Examples:
-            >>> webhook = iii.register_trigger_type(
+            >>> webhook = worker.register_trigger_type(
             ...     RegisterTriggerTypeInput(
             ...         id="webhook",
             ...         description="Webhook trigger",
@@ -845,8 +853,8 @@ class III:
             trigger_type: A ``RegisterTriggerTypeInput`` or dict with ``id`` and optional ``description``.
 
         Examples:
-            >>> iii.unregister_trigger_type({"id": "webhook", "description": "Webhook trigger"})
-            >>> iii.unregister_trigger_type(RegisterTriggerTypeInput(id="webhook", description="Webhook trigger"))
+            >>> worker.unregister_trigger_type({"id": "webhook", "description": "Webhook trigger"})
+            >>> worker.unregister_trigger_type(RegisterTriggerTypeInput(id="webhook", description="Webhook trigger"))
         """
         if isinstance(trigger_type, dict):
             type_id = trigger_type["id"]
@@ -870,12 +878,12 @@ class III:
             the engine as part of the registration message.
 
         Examples:
-            >>> trigger = iii.register_trigger({
+            >>> trigger = worker.register_trigger({
             ...   'type': 'http',
             ...   'function_id': 'greet',
             ...   'config': {'api_path': '/greet', 'http_method': 'GET'}
             ... })
-            >>> trigger = iii.register_trigger(RegisterTriggerInput(
+            >>> trigger = worker.register_trigger(RegisterTriggerInput(
             ...     type="http", function_id="greet",
             ...     config={'api_path': '/greet', 'http_method': 'GET'}
             ... ))
@@ -959,7 +967,7 @@ class III:
         Examples:
             >>> def greet(data):
             ...     return {'message': f"Hello, {data['name']}!"}
-            >>> fn = iii.register_function("greet", greet, description="Greets a user")
+            >>> fn = worker.register_function("greet", greet, description="Greets a user")
             >>> fn.unregister()
 
             >>> from pydantic import BaseModel
@@ -969,7 +977,7 @@ class III:
             ...     message: str
             >>> async def greet(data: GreetInput) -> GreetOutput:
             ...     return GreetOutput(message=f"Hello, {data.name}!")
-            >>> fn = iii.register_function("greet", greet, description="Greets a user")
+            >>> fn = worker.register_function("greet", greet, description="Greets a user")
         """
         if not isinstance(function_id, str):
             raise TypeError(
@@ -1073,13 +1081,13 @@ class III:
             actions.
 
         Raises:
-            IIITimeoutError: If the invocation times out. ``code == 'TIMEOUT'``.
-            IIIForbiddenError: If RBAC denies the invocation. ``code == 'FORBIDDEN'``.
-            IIIInvocationError: For any other engine rejection.
+            InvocationError: For any engine rejection. Inspect ``code``:
+                ``'TIMEOUT'`` if the invocation timed out, ``'FORBIDDEN'`` if
+                RBAC denied it.
 
         Examples:
-            >>> result = iii.trigger({'function_id': 'greet', 'payload': {'name': 'World'}})
-            >>> iii.trigger({'function_id': 'notify', 'payload': {}, 'action': TriggerAction.Void()})
+            >>> result = worker.trigger({'function_id': 'greet', 'payload': {'name': 'World'}})
+            >>> worker.trigger({'function_id': 'notify', 'payload': {}, 'action': TriggerAction.Void()})
         """
         return self._run_on_loop(self.trigger_async(request))
 
@@ -1100,9 +1108,9 @@ class III:
             The result of the function invocation, or ``None`` for void calls.
 
         Raises:
-            IIITimeoutError: If the invocation times out. ``code == 'TIMEOUT'``.
-            IIIForbiddenError: If RBAC denies the invocation. ``code == 'FORBIDDEN'``.
-            IIIInvocationError: For any other engine rejection.
+            InvocationError: For any engine rejection. Inspect ``code``:
+                ``'TIMEOUT'`` if the invocation timed out, ``'FORBIDDEN'`` if
+                RBAC denied it.
 
         Examples:
             >>> result = await iii.trigger_async({'function_id': 'greet', 'payload': {'name': 'World'}})
@@ -1163,7 +1171,7 @@ class III:
             return await asyncio.wait_for(future, timeout=timeout_secs)
         except asyncio.TimeoutError:
             self._pending.pop(invocation_id, None)
-            raise IIITimeoutError(
+            raise InvocationError(
                 code="TIMEOUT",
                 message=f"invocation timed out after {timeout_ms}ms",
                 function_id=function_id,
@@ -1227,7 +1235,7 @@ class III:
             ),
         }
 
-        return {
+        metadata: dict[str, Any] = {
             "runtime": "python",
             "version": sdk_version,
             "name": worker_name,
@@ -1236,6 +1244,11 @@ class III:
             "isolation": os.environ.get("III_ISOLATION") or None,
             "telemetry": telemetry,
         }
+        # Optional, like the other SDKs: only send `description` when set so the
+        # engine's `#[serde(default)]` field stays absent otherwise.
+        if self._options.worker_description:
+            metadata["description"] = self._options.worker_description
+        return metadata
 
     def _register_worker_metadata(self) -> None:
         msg = InvokeFunctionMessage(
@@ -1295,8 +1308,8 @@ class TriggerAction:
 
     Examples:
         >>> from iii import TriggerAction
-        >>> iii.trigger({'function_id': 'process', 'payload': {}, 'action': TriggerAction.Enqueue(queue='jobs')})
-        >>> iii.trigger({'function_id': 'notify', 'payload': {}, 'action': TriggerAction.Void()})
+        >>> worker.trigger({'function_id': 'process', 'payload': {}, 'action': TriggerAction.Enqueue(queue='jobs')})
+        >>> worker.trigger({'function_id': 'notify', 'payload': {}, 'action': TriggerAction.Void()})
     """
 
     @staticmethod
@@ -1331,7 +1344,7 @@ def register_worker(address: str, options: InitOptions | None = None) -> III:
 
     Examples:
         >>> from iii import register_worker, InitOptions
-        >>> iii = register_worker('ws://localhost:49134', InitOptions(worker_name='my-worker'))
+        >>> worker = register_worker('ws://localhost:49134', InitOptions(worker_name='my-worker'))
     """
     client = III(address, options)
     client._wait_until_connected()

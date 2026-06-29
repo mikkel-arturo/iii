@@ -7,7 +7,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
-use iii_sdk::{UpdateOp, UpdateResult, types::SetResult};
+use iii_helpers::stream::{StreamSetResult, StreamUpdateResult, UpdateOp};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -40,7 +40,7 @@ impl StateAdapter for BuiltinKvStoreAdapter {
         Ok(())
     }
 
-    async fn set(&self, scope: &str, key: &str, value: Value) -> anyhow::Result<SetResult> {
+    async fn set(&self, scope: &str, key: &str, value: Value) -> anyhow::Result<StreamSetResult> {
         Ok(self
             .storage
             .set(scope.to_string(), key.to_string(), value.clone())
@@ -63,7 +63,7 @@ impl StateAdapter for BuiltinKvStoreAdapter {
         scope: &str,
         key: &str,
         ops: Vec<UpdateOp>,
-    ) -> anyhow::Result<UpdateResult> {
+    ) -> anyhow::Result<StreamUpdateResult> {
         Ok(self
             .storage
             .update(scope.to_string(), key.to_string(), ops)
@@ -76,6 +76,13 @@ impl StateAdapter for BuiltinKvStoreAdapter {
 
     async fn list_groups(&self) -> anyhow::Result<Vec<String>> {
         Ok(self.storage.list_groups().await)
+    }
+
+    async fn reconfigure(&self, config: &Value) -> anyhow::Result<()> {
+        // Only `save_interval_ms` is hot-tunable for the kv store; respawns the
+        // save loop when file-backed, no-op otherwise.
+        self.storage.reconfigure(config);
+        Ok(())
     }
 }
 

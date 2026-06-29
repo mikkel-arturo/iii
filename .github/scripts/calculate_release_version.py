@@ -105,6 +105,37 @@ def next_dry_run_counter(base: str, existing_tags: list[str], tag_prefix: str) -
     return max(nums) + 1 if nums else 1
 
 
+def highest_inflight_prerelease_base(
+    existing_tags: list[str],
+    tag_prefix: str,
+    latest_stable: str | None,
+) -> str | None:
+    """Highest prerelease base, under ``tag_prefix``, strictly above the latest stable.
+
+    Drives the ``bump="none"`` path: it lets a release iterate an in-flight
+    prerelease train (e.g. ``0.19.5-next.1`` -> ``0.19.5-next.2``) without
+    advancing the base. Any prerelease channel counts toward the base
+    detection, so ``next`` and ``rc`` of the same upcoming release share it.
+
+    Returns ``None`` when no prerelease tag sits above ``latest_stable`` — the
+    alpha-from-stable case, where every prerelease anchors on the current
+    stable — so callers fall back to anchoring on the stable release itself.
+    """
+    pattern = re.compile(rf"^{re.escape(tag_prefix)}/v(\d+\.\d+\.\d+)-[a-z]+\.\d+$")
+    floor = parse_version(latest_stable) if latest_stable else None
+    best: Version | None = None
+    for t in existing_tags:
+        if not (m := pattern.match(t)):
+            continue
+        base = parse_version(m.group(1))
+        key = (base.major, base.minor, base.patch)
+        if floor is not None and key <= (floor.major, floor.minor, floor.patch):
+            continue
+        if best is None or key > (best.major, best.minor, best.patch):
+            best = base
+    return best.base if best else None
+
+
 def calculate_version(
     current: str,
     bump_type: str,
@@ -116,6 +147,10 @@ def calculate_version(
     """Decide the next version, accounting for the current prerelease train.
 
     Rules:
+      - `none` never advances the base: it iterates the prerelease
+        counter on the in-flight train (the highest prerelease base above
+        the latest stable), or on the latest stable when no such train
+        exists (alpha-from-stable). Requires a prerelease label.
       - Promoting a prerelease to stable (prerelease == "none" and current
         has a prerelease label) keeps the base as-is.
       - `patch` always increments the patch component of the current
@@ -128,12 +163,31 @@ def calculate_version(
         beyond the current level, restart from the latest stable.
       - Otherwise apply the requested bump to the current base.
     """
+    cur = parse_version(current)
+
+    if bump_type == "none":
+        # Iterate-only mode: never advances the base, only the prerelease
+        # counter. Two scenarios resolve to the same operation:
+        #   - Continue an in-flight train (create-tag): if a prerelease tag
+        #     sits above the latest stable, anchor on its base so repeated
+        #     `none` releases iterate 0.19.5-next.1 -> .2 -> .3 instead of
+        #     re-bumping the base. To START a train, use patch/minor/major.
+        #   - Alpha-from-stable: when no prerelease train exists above the
+        #     latest stable, anchor on the stable release (fall back to the
+        #     current base when there is no stable yet).
+        if prerelease not in PRERELEASE_LABELS:
+            raise ValueError(
+                f"bump_type 'none' requires a prerelease label, got {prerelease!r}"
+            )
+        inflight = highest_inflight_prerelease_base(existing_tags, tag_prefix, latest_stable)
+        new_base = inflight or latest_stable or cur.base
+        counter = next_prerelease_counter(new_base, prerelease, existing_tags, tag_prefix)
+        return f"{new_base}-{prerelease}.{counter}"
+
     if bump_type not in BUMP_RANK:
         raise ValueError(f"unknown bump_type: {bump_type!r}")
     if prerelease != "none" and prerelease not in PRERELEASE_LABELS:
         raise ValueError(f"unknown prerelease: {prerelease!r}")
-
-    cur = parse_version(current)
 
     if prerelease == "none" and cur.prerelease_label is not None:
         # Promote prerelease to stable.
@@ -216,16 +270,27 @@ def _emit(name: str, value: str) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--target", required=True)
-    parser.add_argument("--bump", required=True, choices=list(BUMP_RANK))
+    parser.add_argument("--bump", required=True, choices=list(BUMP_RANK) + ["none"])
     parser.add_argument("--prerelease", required=True)
+    parser.add_argument(
+        "--counter-tag-prefix",
+        default=None,
+        help=(
+            "Tag prefix used when scanning for the prerelease counter "
+            "(default: --target). Lets alpha releases accumulate under a "
+            "separate namespace, e.g. iii-alpha, without colliding with the "
+            "official iii/v* tags."
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--current-version-file", required=True)
     args = parser.parse_args(argv)
 
     current = _read_cargo_version(args.current_version_file)
     tags = _git_tags()
-    tag_prefix = args.target
-    latest_stable = latest_stable_from_tags(tags, tag_prefix)
+    stable_prefix = args.target
+    counter_prefix = args.counter_tag_prefix or args.target
+    latest_stable = latest_stable_from_tags(tags, stable_prefix)
 
     new_ver = calculate_version(
         current=current,
@@ -233,12 +298,12 @@ def main(argv: list[str] | None = None) -> int:
         prerelease=args.prerelease,
         latest_stable=latest_stable,
         existing_tags=tags,
-        tag_prefix=tag_prefix,
+        tag_prefix=counter_prefix,
     )
 
     if args.dry_run:
         base_ver = new_ver.split("-", 1)[0]
-        counter = next_dry_run_counter(base_ver, tags, tag_prefix)
+        counter = next_dry_run_counter(base_ver, tags, counter_prefix)
         new_ver = f"{base_ver}-dry-run.{counter}"
 
     py_ver = to_pep440(new_ver)
@@ -247,11 +312,11 @@ def main(argv: list[str] | None = None) -> int:
 
     _emit("version", new_ver)
     _emit("python_version", py_ver)
-    _emit("tag", f"{tag_prefix}/v{new_ver}")
+    _emit("tag", f"{counter_prefix}/v{new_ver}")
     _emit("current", current)
     _emit("is_prerelease", "true" if is_prerelease else "false")
     _emit("npm_tag", npm_tag)
-    print(f"::notice::{tag_prefix}: {current} -> {new_ver} (python: {py_ver})", file=sys.stderr)
+    print(f"::notice::{counter_prefix}: {current} -> {new_ver} (python: {py_ver})", file=sys.stderr)
     return 0
 
 

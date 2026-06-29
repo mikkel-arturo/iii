@@ -82,7 +82,7 @@ When one fits, install it: `worker::add { source: { kind: 'registry', name: '<wo
 // worker::add { source: { kind: 'registry', name: 'iii-directory' }, wait: true }
 ```
 
-**3. Build a worker.** Only when steps 1 and 2 both come up empty. Author it with the SDK (below), then deploy it. Discover the deployment/runtime surface the same way as any other capability — `directory::registry::workers::list` / `::info` and its skill — rather than assuming a worker name. (The harness can't side-load local code through `worker::add` — `kind: 'local'` is CLI-only — so a runtime/sandbox worker from the registry is how hand-authored code joins the bus.)
+**3. Build a worker.** Only when steps 1 and 2 both come up empty. Author it with the SDK (below), then deploy it. Discover the deployment/runtime surface the same way as any other capability — `directory::registry::workers::list` / `::info` and its skill — rather than assuming a worker name. (`worker::add { kind: 'local', path }` works over the bus, but `path` resolves on the **engine/daemon host**, not on the caller — so it only helps when your code already lives on that host. For un-published code that lives elsewhere, run it via a runtime/sandbox worker.)
 
 > Discover in order. Don't jump to a worker you remember; the registry may hold a better fit, and the right surface is whatever the live engine and registry report — not training-data recall.
 
@@ -92,9 +92,9 @@ When one fits, install it: `worker::add { source: { kind: 'registry', name: '<wo
 import {
   registerWorker, // factory; opens the WS from your code's perspective synchronously
   TriggerAction, // .Void() | .Enqueue({ queue })
-  IIIInvocationError, // typed error thrown by iii.trigger()
-  Logger, // OTel-aware structured logger; falls back to console.*
+  InvocationError, // typed error thrown by iii.trigger()
 } from 'iii-sdk'
+import { Logger } from '@iii-dev/helpers/observability' // OTel-aware structured logger; falls back to console.*
 
 const iii = registerWorker(process.env.III_ENGINE_URL!, {
   workerName: 'my-worker', // appears in engine::workers::list
@@ -139,7 +139,7 @@ Schemas in `registerFunction` (`description`, `request_format`, `response_format
 
 ### Errors
 
-- **Throw inside the handler** → propagates to the caller as `IIIInvocationError` (carries `code`, `function_id`, `stacktrace`). Use for unexpected failures a retry might fix.
+- **Throw inside the handler** → propagates to the caller as `InvocationError` (carries `code`, `function_id`, `stacktrace`). Use for unexpected failures a retry might fix.
 - **Return a structured value** (`{ ok: false, reason }`) → the call succeeds; the caller branches on the shape. Use for expected failures (validation, not-found, business rules).
 
 Rule of thumb: if a retry might succeed, throw; if it will fail the same way, return a value.
@@ -213,8 +213,10 @@ From the caller's side, your custom type is indistinguishable from any built-in 
 Install, run, and remove workers. Each op is also `iii worker <cmd>` on the CLI. Fetch exact request/response shapes from the engine rather than trusting this list:
 
 ```jsonc
-// engine::functions::info { function_id: 'worker::add' }   → request/response JSON Schema
-// worker::schema { function_id: 'worker::add' }            → same, plus timeout/idempotency hints
+// engine::functions::info { function_id: 'worker::add' }   → request/response JSON Schema,
+//                            plus metadata { default_timeout_ms, idempotent }
+// worker::schema { function_id: 'worker::add' }            → same data, batched for all worker::* ops
+// On a malformed payload the W105 error envelope's details.hint points back at worker::schema.
 ```
 
 | Op | Does |
@@ -228,7 +230,7 @@ Install, run, and remove workers. Each op is also `iii worker <cmd>` on the CLI.
 | `worker::clear` | Delete cached artifacts (keeps config). Requires `yes: true`. |
 | `worker::schema` | JSON Schemas for every op. |
 
-- **`worker::add` source variants:** `{ kind: 'registry', name, version? }`, `{ kind: 'oci', reference }`, and `{ kind: 'local', path }` — the last is **CLI-only** (rejected over the trigger surface).
+- **`worker::add` source variants:** `{ kind: 'registry', name, version? }`, `{ kind: 'oci', reference }`, and `{ kind: 'local', path }` — `path` is resolved on the **engine/daemon host** (works over the trigger as well as the CLI).
 - **Consent:** `remove`, `stop`, and `clear` require exactly `yes: true` (the boolean, not `"true"`).
 - Reach for `worker::list` before any other op when you don't already know what is installed.
 
@@ -259,5 +261,5 @@ Install, run, and remove workers. Each op is also `iii worker <cmd>` on the CLI.
 - **Reinventing what exists.** Run the discovery steps (`engine::functions::list`, then `directory::registry::workers::list`) before authoring anything.
 - **Hardwiring a remembered worker.** Pick the capability the live engine and registry surface, in order — not the one you reached for last time.
 - **Side-channel state between workers.** Don't have workers read each other's files or hit each other's endpoints; route every cross-worker call through `iii.trigger`, and use a shared-state worker (discover one in the registry) for shared key/value.
-- **Catching the wrong error type.** `iii.trigger()` throws `IIIInvocationError`; catch that specifically or you lose `code` / `function_id` / `stacktrace`.
+- **Catching the wrong error type.** `iii.trigger()` throws `InvocationError`; catch that specifically or you lose `code` / `function_id` / `stacktrace`.
 - **Trusting introspection over runtime probes.** An empty `*::list` can mean lag, not absence — a successful `iii.trigger()` is the authoritative signal.

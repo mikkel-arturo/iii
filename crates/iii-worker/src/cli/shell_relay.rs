@@ -15,8 +15,8 @@
 //! concurrent exec sessions on the same port by routing frames on
 //! their `corr_id` (see `iii_supervisor::shell_protocol`).
 //!
-//! Design mirrors microsandbox's `runtime::relay`: the relay does
-//! **not** parse JSON payloads, only the fixed-size frame header.
+//! Design: the relay does **not** parse JSON payloads, only the
+//! fixed-size frame header.
 //! This keeps routing cheap and isolates the relay from protocol
 //! additions — new `ShellMessage` variants don't touch this file.
 //!
@@ -723,8 +723,7 @@ async fn client_session(
 
 /// Read one full frame (length prefix + body). `Ok(None)` on EOF at
 /// a frame boundary. Returned buffer includes the 4-byte length
-/// prefix so callers forward verbatim. Skips zero-fill of the body
-/// via `set_len` + `read_exact` (SAFETY below).
+/// prefix so callers forward verbatim.
 async fn read_frame<R: AsyncReadExt + Unpin>(
     reader: &mut R,
 ) -> std::io::Result<Option<FrameBytes>> {
@@ -739,16 +738,22 @@ async fn read_frame<R: AsyncReadExt + Unpin>(
             format!("frame length {frame_len} out of range"),
         ));
     }
-    let total = 4 + frame_len;
-    let mut buf: FrameBytes = Vec::with_capacity(total);
-    // SAFETY: `u8` has no invalid bit patterns. The uninit capacity
-    // is fully overwritten by `copy_from_slice` + `read_exact` before
-    // any read; on error we truncate + drop without observing.
-    unsafe { buf.set_len(total) };
-    buf[..4].copy_from_slice(&len_buf);
-    if let Err(e) = reader.read_exact(&mut buf[4..]).await {
-        buf.truncate(0);
-        return Err(e);
+    // Incremental read with a capped initial allocation (no uninit memory,
+    // no full-size zero-fill): memory grows only as payload arrives, so a
+    // peer sending a max-size length prefix and stalling costs at most
+    // FRAME_READ_INITIAL_CAP, not MAX_FRAME_SIZE.
+    let mut buf: FrameBytes =
+        Vec::with_capacity((4 + frame_len).min(iii_shell_proto::FRAME_READ_INITIAL_CAP));
+    buf.extend_from_slice(&len_buf);
+    let read = (&mut *reader)
+        .take(frame_len as u64)
+        .read_to_end(&mut buf)
+        .await?;
+    if read != frame_len {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "partial frame body",
+        ));
     }
     Ok(Some(buf))
 }

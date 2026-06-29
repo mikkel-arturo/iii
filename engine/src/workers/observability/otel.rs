@@ -14,19 +14,20 @@
 //! - `memory`: Store traces in memory for API querying
 
 use super::config::{LogsExporterType, ObservabilityWorkerConfig, OtelExporterType};
+use super::otlp_exporter::build_span_exporter;
 use super::sampler::AdvancedSampler;
 use opentelemetry::propagation::{TextMapCompositePropagator, TextMapPropagator};
 use opentelemetry::{
     Context, KeyValue, global,
     trace::{TraceContextExt, TracerProvider as _},
 };
-use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::{
     Resource,
     error::OTelSdkResult,
     propagation::{BaggagePropagator, TraceContextPropagator},
     trace::{RandomIdGenerator, Sampler, SdkTracerProvider, SpanData, SpanExporter},
 };
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
@@ -41,27 +42,69 @@ use tracing_subscriber::registry::LookupSpan;
 /// Default maximum number of spans to keep in memory.
 const DEFAULT_MEMORY_MAX_SPANS: usize = 1000;
 
-/// Global OTEL configuration set from YAML config
-static GLOBAL_OTEL_CONFIG: OnceLock<ObservabilityWorkerConfig> = OnceLock::new();
+/// Global OTEL configuration. Seeded from YAML config (or the persisted
+/// configuration entry) at boot, and swappable at runtime by the
+/// configuration-worker apply path.
+static GLOBAL_OTEL_CONFIG: RwLock<Option<Arc<ObservabilityWorkerConfig>>> = RwLock::new(None);
 
-/// Set the global OTEL configuration from the module.
+/// Set the global OTEL configuration (first-set only).
 /// This should be called during module initialization, before logging is set up.
 ///
 /// Returns true if the config was set, false if it was already initialized.
 pub fn set_otel_config(config: ObservabilityWorkerConfig) -> bool {
-    if GLOBAL_OTEL_CONFIG.set(config).is_ok() {
-        true
-    } else {
-        // Config already set - this can happen if module is re-initialized
-        // Log at debug level since this is expected in some scenarios
+    let was_set = {
+        let mut slot = GLOBAL_OTEL_CONFIG
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if slot.is_none() {
+            *slot = Some(Arc::new(config));
+            true
+        } else {
+            false
+        }
+    };
+    // Log AFTER releasing the write guard: std RwLock is non-reentrant, and a
+    // tracing event flows through the subscriber stack — a layer that ever
+    // reads the global config in its event path would otherwise self-deadlock.
+    if !was_set {
         tracing::debug!("OTEL config already initialized, ignoring new config");
-        false
     }
+    was_set
+}
+
+/// Unconditionally replace the global OTEL configuration (the authoritative
+/// configuration-worker apply path). Per-use readers (ingest gates,
+/// `logs_console_output`, `logs_sampling_ratio`, ...) observe the new value
+/// immediately; state built from the previous snapshot (providers, layers,
+/// spawned tasks) is updated by the caller's apply logic. Returns the
+/// previous value.
+pub fn update_otel_config(
+    config: ObservabilityWorkerConfig,
+) -> Option<Arc<ObservabilityWorkerConfig>> {
+    let mut slot = GLOBAL_OTEL_CONFIG
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    slot.replace(Arc::new(config))
+}
+
+/// Test-only: clear the global OTEL config back to its unset baseline. The
+/// global is process-wide and is NOT reset between tests, so a `#[serial]`
+/// test that calls `update_otel_config` must clear afterward — otherwise it
+/// pollutes sibling tests that rely on `current_config()` falling back to the
+/// worker's own `_config`.
+#[cfg(test)]
+pub(crate) fn clear_otel_config_for_test() {
+    *GLOBAL_OTEL_CONFIG
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
 }
 
 /// Get the global OTEL configuration if set.
-pub fn get_otel_config() -> Option<&'static ObservabilityWorkerConfig> {
-    GLOBAL_OTEL_CONFIG.get()
+pub fn get_otel_config() -> Option<Arc<ObservabilityWorkerConfig>> {
+    GLOBAL_OTEL_CONFIG
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
 }
 
 /// Decide whether OTEL logs storage / emission should be active, given an
@@ -108,6 +151,7 @@ impl Default for OtelConfig {
     fn default() -> Self {
         // First check global config from YAML, then fall back to environment variables
         let global_cfg = get_otel_config();
+        let global_cfg = global_cfg.as_deref();
 
         let enabled = global_cfg
             .and_then(|c| c.enabled)
@@ -419,7 +463,9 @@ impl StoredSpan {
 /// In-memory span storage with circular buffer and broadcast channel.
 pub struct InMemorySpanStorage {
     spans: RwLock<VecDeque<StoredSpan>>,
-    max_spans: usize,
+    /// Capacity limit. Atomic so the configuration-worker apply path can
+    /// retune it at runtime; enforcement happens on every insert.
+    max_spans: std::sync::atomic::AtomicUsize,
     /// Secondary index: trace_id -> set of span indices for O(1) trace lookups
     spans_by_trace_id: RwLock<HashMap<String, HashSet<usize>>>,
     /// Broadcast of every span as it lands, driving the `trace` trigger
@@ -431,7 +477,10 @@ impl std::fmt::Debug for InMemorySpanStorage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InMemorySpanStorage")
             .field("spans", &self.spans)
-            .field("max_spans", &self.max_spans)
+            .field(
+                "max_spans",
+                &self.max_spans.load(std::sync::atomic::Ordering::Relaxed),
+            )
             .field("spans_by_trace_id", &self.spans_by_trace_id)
             .finish()
     }
@@ -442,9 +491,28 @@ impl InMemorySpanStorage {
         let (tx, _) = broadcast::channel(1024);
         Self {
             spans: RwLock::new(VecDeque::with_capacity(max_spans)),
-            max_spans,
+            max_spans: std::sync::atomic::AtomicUsize::new(max_spans),
             spans_by_trace_id: RwLock::new(HashMap::new()),
             tx,
+        }
+    }
+
+    /// Retune the capacity at runtime. A shrink evicts oldest spans in one
+    /// O(n) pass (drain + index rebuild) under the same lock order as
+    /// `add_spans` (spans, then index) to avoid lock-order inversion.
+    pub fn set_max_spans(&self, max: usize) {
+        let max = max.max(1);
+        self.max_spans
+            .store(max, std::sync::atomic::Ordering::Relaxed);
+        let mut spans = self.spans.write().unwrap();
+        if spans.len() > max {
+            let mut index = self.spans_by_trace_id.write().unwrap();
+            let excess = spans.len() - max;
+            spans.drain(..excess);
+            index.clear();
+            for (idx, span) in spans.iter().enumerate() {
+                index.entry(span.trace_id.clone()).or_default().insert(idx);
+            }
         }
     }
 
@@ -452,9 +520,13 @@ impl InMemorySpanStorage {
         let mut spans = self.spans.write().unwrap();
         let mut index = self.spans_by_trace_id.write().unwrap();
 
+        let max_spans = self
+            .max_spans
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .max(1);
         for span in new_spans {
-            // Evict oldest if at capacity
-            if spans.len() >= self.max_spans
+            // Evict oldest if at capacity (loop converges after a shrink)
+            while spans.len() >= max_spans
                 && let Some(old) = spans.pop_front()
             {
                 // Remove from index and shift all indices down
@@ -671,32 +743,163 @@ impl SpanExporter for TeeSpanExporter {
     }
 }
 
+/// Swappable sampler indirection. The tracer provider (and the SDK span
+/// forwarder) hold clones of this wrapper; the configuration-worker apply
+/// path swaps the inner sampler so `sampling_ratio` / `sampling` changes
+/// take effect without rebuilding the provider.
+#[derive(Clone, Debug)]
+pub struct DynamicSampler {
+    inner: Arc<RwLock<Sampler>>,
+}
+
+impl DynamicSampler {
+    pub fn new(initial: Sampler) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(initial)),
+        }
+    }
+
+    pub fn swap(&self, new: Sampler) {
+        *self
+            .inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = new;
+    }
+}
+
+impl opentelemetry_sdk::trace::ShouldSample for DynamicSampler {
+    fn should_sample(
+        &self,
+        parent_context: Option<&opentelemetry::Context>,
+        trace_id: opentelemetry::trace::TraceId,
+        name: &str,
+        span_kind: &opentelemetry::trace::SpanKind,
+        attributes: &[opentelemetry::KeyValue],
+        links: &[opentelemetry::trace::Link],
+    ) -> opentelemetry::trace::SamplingResult {
+        self.inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .should_sample(parent_context, trace_id, name, span_kind, attributes, links)
+    }
+}
+
+/// The sampler installed into the tracer provider at init, swappable at
+/// runtime. Unset when the pipeline never initialized (observability
+/// disabled at boot) — sampler changes are restart-tier in that case.
+static DYNAMIC_SAMPLER: OnceLock<DynamicSampler> = OnceLock::new();
+
+pub(super) fn get_dynamic_sampler() -> Option<&'static DynamicSampler> {
+    DYNAMIC_SAMPLER.get()
+}
+
+/// Rebuild the sampler from the live global configuration and swap it into
+/// the running pipeline (engine tracer + SDK span forwarder share one
+/// inner). No-op when the pipeline never initialized.
+pub fn refresh_sampler() {
+    if let Some(dynamic) = DYNAMIC_SAMPLER.get() {
+        dynamic.swap(build_sampler(&OtelConfig::default()));
+    }
+}
+
 static TRACER_PROVIDER: OnceLock<SdkTracerProvider> = OnceLock::new();
 
-/// Global OTLP exporter for forwarding SDK-ingested spans to the collector.
-/// `SpanExporter::export` takes `&self`, so no Mutex is needed.
-static SDK_SPAN_FORWARDER: OnceLock<Arc<opentelemetry_otlp::SpanExporter>> = OnceLock::new();
+/// OTLP collector endpoint used to lazily build per-service SDK span forwarders.
+static SDK_FORWARDER_ENDPOINT: OnceLock<String> = OnceLock::new();
 
-/// Build a second OTLP span exporter and store it in the global `SDK_SPAN_FORWARDER`
-/// so that SDK-ingested spans can be forwarded to the collector.
+/// Per-`service.name` OTLP span exporters for forwarding SDK-ingested (worker)
+/// spans to the collector. Keyed by service name so each worker's spans are
+/// exported under their OWN resource (`service.name`) instead of being stripped
+/// to the OTLP default identity (`unknown_service`).
+static SDK_SPAN_FORWARDERS: OnceLock<
+    RwLock<HashMap<String, Arc<opentelemetry_otlp::SpanExporter>>>,
+> = OnceLock::new();
+
+/// Record the collector endpoint so SDK-ingested spans can later be
+/// forwarded to the collector, per-service. Forwarded spans honor the same
+/// swappable sampler as the engine tracer (`DYNAMIC_SAMPLER`), so the
+/// collector volume follows `sampling_ratio` even after a runtime change.
 fn init_sdk_span_forwarder(endpoint: &str) {
-    match opentelemetry_otlp::SpanExporter::builder()
-        .with_tonic()
-        .with_endpoint(endpoint)
-        .build()
+    let _ = SDK_FORWARDER_ENDPOINT.set(endpoint.to_string());
+    let _ = SDK_SPAN_FORWARDERS.set(RwLock::new(HashMap::new()));
+}
+
+/// Build a `Resource` from an OTLP resource payload, preserving the worker's
+/// own attributes (notably `service.name`) so forwarded spans are correctly
+/// attributed at the collector rather than landing under `unknown_service`.
+fn build_forward_resource(resource: &Option<OtlpResource>) -> Resource {
+    let attrs: Vec<KeyValue> = resource
+        .as_ref()
+        .map(|r| {
+            r.attributes
+                .iter()
+                .filter_map(otlp_kv_to_key_value)
+                .collect()
+        })
+        .unwrap_or_default();
+    Resource::builder_empty().with_attributes(attrs).build()
+}
+
+/// Get (or lazily build) the OTLP forwarder for a given worker `service.name`,
+/// with the worker's `Resource` attached via `set_resource` so the collector
+/// sees the right service identity.
+fn get_or_build_forwarder(
+    service_name: &str,
+    resource: &Resource,
+) -> Option<Arc<opentelemetry_otlp::SpanExporter>> {
+    let endpoint = SDK_FORWARDER_ENDPOINT.get()?;
+    let forwarders = SDK_SPAN_FORWARDERS.get()?;
+
+    // Fast path under a read lock. The explicit block guarantees the read guard
+    // is released before the write lock is taken below (std `RwLock` is not
+    // reentrant), independent of temporary-drop timing.
     {
-        Ok(forwarder) => {
-            if SDK_SPAN_FORWARDER.set(Arc::new(forwarder)).is_err() {
-                tracing::debug!("SDK span forwarder already initialized");
-            }
+        let map = forwarders.read().ok()?;
+        if let Some(existing) = map.get(service_name) {
+            return Some(existing.clone());
+        }
+    }
+
+    let mut map = forwarders.write().ok()?;
+    // Re-check under the write lock in case another task built it meanwhile.
+    if let Some(existing) = map.get(service_name) {
+        return Some(existing.clone());
+    }
+    match build_span_exporter(endpoint.as_str()) {
+        Ok(mut exporter) => {
+            exporter.set_resource(resource);
+            let arc = Arc::new(exporter);
+            map.insert(service_name.to_string(), arc.clone());
+            Some(arc)
         }
         Err(e) => {
             tracing::warn!(
                 error = %e,
-                "Failed to create SDK span forwarder, SDK spans will not be exported to collector"
+                service_name = %service_name,
+                "Failed to create SDK span forwarder; spans will not be exported to collector"
             );
+            None
         }
     }
+}
+
+/// Whether the engine sampler keeps a forwarded worker span. The trace-id ratio
+/// is deterministic per trace, so an entire trace is kept or dropped
+/// consistently regardless of which service produced a given span.
+fn forward_span_is_sampled<S: opentelemetry_sdk::trace::ShouldSample>(
+    sampler: &S,
+    sd: &SpanData,
+) -> bool {
+    use opentelemetry::trace::SamplingDecision;
+    let result = sampler.should_sample(
+        None,
+        sd.span_context.trace_id(),
+        sd.name.as_ref(),
+        &sd.span_kind,
+        &sd.attributes,
+        &sd.links.links,
+    );
+    matches!(result.decision, SamplingDecision::RecordAndSample)
 }
 
 /// Initialize OpenTelemetry with the given configuration.
@@ -720,8 +923,24 @@ where
         Box::new(BaggagePropagator::new()),
     ]));
 
-    // Build the sampler using advanced configuration if available
-    let sampler = build_sampler(config);
+    // Build the sampler using advanced configuration if available, wrapped
+    // in the swappable indirection so runtime configuration changes apply
+    // without a provider rebuild. If init_otel runs again in-process, reuse
+    // the already-registered handle (swapping its inner) instead of building a
+    // detached one — otherwise the provider would hold a sampler that
+    // refresh_sampler() no longer drives, silently freezing runtime sampling.
+    let built = build_sampler(config);
+    let sampler = match DYNAMIC_SAMPLER.get() {
+        Some(existing) => {
+            existing.swap(built);
+            existing.clone()
+        }
+        None => {
+            let sampler = DynamicSampler::new(built);
+            let _ = DYNAMIC_SAMPLER.set(sampler.clone());
+            sampler
+        }
+    };
 
     // Build resource attributes with OTEL semantic conventions
     // Using string keys for attributes not available in the crate version
@@ -743,11 +962,7 @@ where
     // Build tracer provider based on exporter type
     let provider = match config.exporter {
         ExporterType::Otlp => {
-            match opentelemetry_otlp::SpanExporter::builder()
-                .with_tonic()
-                .with_endpoint(&config.endpoint)
-                .build()
-            {
+            match build_span_exporter(&config.endpoint) {
                 Ok(exporter) => {
                     init_sdk_span_forwarder(&config.endpoint);
 
@@ -757,7 +972,9 @@ where
                     let _ = IN_MEMORY_STORAGE.set(memory_storage);
 
                     SdkTracerProvider::builder()
-                        .with_span_processor(iii_observability::BaggageSpanProcessor::default())
+                        .with_span_processor(
+                            iii_helpers::observability::BaggageSpanProcessor::default(),
+                        )
                         .with_batch_exporter(exporter)
                         .with_sampler(sampler)
                         .with_id_generator(RandomIdGenerator::default())
@@ -776,7 +993,9 @@ where
                         config.service_name.clone(),
                     );
                     SdkTracerProvider::builder()
-                        .with_span_processor(iii_observability::BaggageSpanProcessor::default())
+                        .with_span_processor(
+                            iii_helpers::observability::BaggageSpanProcessor::default(),
+                        )
                         .with_simple_exporter(exporter)
                         .with_sampler(sampler)
                         .with_id_generator(RandomIdGenerator::default())
@@ -790,7 +1009,7 @@ where
                 InMemorySpanExporter::new(config.memory_max_spans, config.service_name.clone());
 
             SdkTracerProvider::builder()
-                .with_span_processor(iii_observability::BaggageSpanProcessor::default())
+                .with_span_processor(iii_helpers::observability::BaggageSpanProcessor::default())
                 .with_simple_exporter(exporter)
                 .with_sampler(sampler)
                 .with_id_generator(RandomIdGenerator::default())
@@ -805,11 +1024,7 @@ where
             }
 
             // Try to create OTLP exporter
-            match opentelemetry_otlp::SpanExporter::builder()
-                .with_tonic()
-                .with_endpoint(&config.endpoint)
-                .build()
-            {
+            match build_span_exporter(&config.endpoint) {
                 Ok(otlp_exporter) => {
                     init_sdk_span_forwarder(&config.endpoint);
 
@@ -821,7 +1036,9 @@ where
                     );
 
                     SdkTracerProvider::builder()
-                        .with_span_processor(iii_observability::BaggageSpanProcessor::default())
+                        .with_span_processor(
+                            iii_helpers::observability::BaggageSpanProcessor::default(),
+                        )
                         .with_batch_exporter(tee_exporter)
                         .with_sampler(sampler)
                         .with_id_generator(RandomIdGenerator::default())
@@ -840,7 +1057,9 @@ where
                         config.service_name.clone(),
                     );
                     SdkTracerProvider::builder()
-                        .with_span_processor(iii_observability::BaggageSpanProcessor::default())
+                        .with_span_processor(
+                            iii_helpers::observability::BaggageSpanProcessor::default(),
+                        )
                         .with_simple_exporter(exporter)
                         .with_sampler(sampler)
                         .with_id_generator(RandomIdGenerator::default())
@@ -988,6 +1207,44 @@ pub fn extract_context(traceparent: Option<&str>, baggage: Option<&str>) -> Cont
     // aligned with the SDK helper when one header is invalid or absent.
     let ctx = TraceContextPropagator::new().extract(&carrier);
     BaggagePropagator::new().extract_with_context(&ctx, &carrier)
+}
+
+/// Baggage key the `BaggageSpanProcessor` copies onto every span as the
+/// `iii.function.id` attribute (see the SDK observability crate allowlist).
+const FUNCTION_ID_BAGGAGE_KEY: &str = "iii.function.id";
+
+/// Return a context identical to `cx` but with the `iii.function.id` baggage
+/// entry set to `function_id` (all other baggage entries are preserved).
+///
+/// `BaggageSpanProcessor` stamps `iii.function.id` onto every span from the
+/// parent context's baggage, but an enqueuer's baggage names the *enqueuer*, not
+/// the function being enqueued. Rewriting it at the enqueue boundary makes the
+/// `enqueue`/`fn_queue` spans (and the baggage delivered to the target worker)
+/// carry the TARGET function id, so grouping traces by `iii.function.id`
+/// attributes those spans to the function they actually serve.
+pub fn with_function_id_baggage(cx: &Context, function_id: &str) -> Context {
+    use opentelemetry::baggage::BaggageExt;
+    // Drop any existing entry for the key, then re-add — mirrors the SDK's
+    // `set_baggage_entry` so we replace rather than duplicate.
+    let mut entries: Vec<KeyValue> = cx
+        .baggage()
+        .iter()
+        .filter(|(k, _)| k.as_str() != FUNCTION_ID_BAGGAGE_KEY)
+        .map(|(k, (v, _meta))| KeyValue::new(k.clone(), v.clone()))
+        .collect();
+    entries.push(KeyValue::new(
+        FUNCTION_ID_BAGGAGE_KEY,
+        function_id.to_string(),
+    ));
+    cx.with_baggage(entries)
+}
+
+/// W3C-header variant of [`with_function_id_baggage`] for code paths that carry
+/// baggage as a header string rather than a [`Context`] (e.g. queue messages).
+/// Always returns `Some` — at minimum the header names the target function.
+pub fn baggage_with_function_id(baggage: Option<&str>, function_id: &str) -> Option<String> {
+    let ctx = with_function_id_baggage(&extract_baggage(baggage.unwrap_or_default()), function_id);
+    inject_baggage_from_context(&ctx)
 }
 
 // =============================================================================
@@ -1468,7 +1725,24 @@ fn otlp_kv_to_key_value(kv: &OtlpKeyValue) -> Option<KeyValue> {
 }
 
 /// Convert parsed OTLP spans to SpanData for export via the OTel SDK pipeline.
+///
+/// Production forwarding goes through [`convert_resource_span_to_span_data`]
+/// one resource at a time (see `ingest_otlp_json`); this whole-request wrapper
+/// is retained for unit tests that assert over a full OTLP request.
+#[cfg(test)]
 fn convert_otlp_to_span_data(request: &OtlpExportTraceServiceRequest) -> Vec<SpanData> {
+    request
+        .resource_spans
+        .iter()
+        .flat_map(convert_resource_span_to_span_data)
+        .collect()
+}
+
+/// Convert a single OTLP `resource_span` group (one worker `service.name`) to
+/// `SpanData`. Split out from [`convert_otlp_to_span_data`] so the SDK span
+/// forwarder can process one resource at a time and attach the matching
+/// `Resource` before exporting to the collector.
+fn convert_resource_span_to_span_data(resource_span: &OtlpResourceSpans) -> Vec<SpanData> {
     use opentelemetry::trace::{
         Event, Link, SpanContext, SpanKind, Status, TraceFlags, TraceState,
     };
@@ -1479,7 +1753,7 @@ fn convert_otlp_to_span_data(request: &OtlpExportTraceServiceRequest) -> Vec<Spa
 
     let mut span_data_vec = Vec::new();
 
-    for resource_span in &request.resource_spans {
+    {
         for scope_span in &resource_span.scope_spans {
             let scope = scope_span
                 .scope
@@ -1783,14 +2057,35 @@ pub async fn ingest_otlp_json(json_str: &str) -> anyhow::Result<()> {
         }
     }
 
-    // Forward to OTLP collector if forwarder is available
-    if let Some(forwarder) = SDK_SPAN_FORWARDER.get() {
-        let span_data = convert_otlp_to_span_data(&request);
-        if !span_data.is_empty() {
+    // Forward to the OTLP collector, one resource (worker service.name) at a
+    // time so each batch carries the correct service identity, and honoring the
+    // engine sampler so forwarded volume matches `sampling_ratio` (worker SDKs
+    // export to the engine at 100%).
+    if SDK_FORWARDER_ENDPOINT.get().is_some() {
+        let sampler = get_dynamic_sampler();
+        for resource_span in &request.resource_spans {
+            let mut span_data = convert_resource_span_to_span_data(resource_span);
+            if let Some(sampler) = sampler {
+                span_data.retain(|sd| forward_span_is_sampled(sampler, sd));
+            }
+            if span_data.is_empty() {
+                continue;
+            }
+
+            let service_name = extract_service_name(&resource_span.resource);
+            let resource = build_forward_resource(&resource_span.resource);
+            let Some(forwarder) = get_or_build_forwarder(&service_name, &resource) else {
+                continue;
+            };
+
             let count = span_data.len();
             match forwarder.export(span_data).await {
                 Ok(()) => {
-                    tracing::debug!(span_count = count, "Forwarded SDK spans to OTLP collector");
+                    tracing::debug!(
+                        span_count = count,
+                        service_name = %service_name,
+                        "Forwarded SDK spans to OTLP collector"
+                    );
                 }
                 Err(e) => {
                     tracing::warn!(error = ?e, "Failed to forward SDK spans to OTLP collector");
@@ -2189,7 +2484,9 @@ pub struct StoredLog {
 /// In-memory log storage with circular buffer and broadcast channel.
 pub struct InMemoryLogStorage {
     logs: RwLock<VecDeque<StoredLog>>,
-    max_logs: usize,
+    /// Capacity limit. Atomic so the configuration-worker apply path can
+    /// retune it at runtime; enforcement happens on every insert.
+    max_logs: std::sync::atomic::AtomicUsize,
     tx: broadcast::Sender<StoredLog>,
 }
 
@@ -2197,7 +2494,10 @@ impl std::fmt::Debug for InMemoryLogStorage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InMemoryLogStorage")
             .field("logs", &self.logs)
-            .field("max_logs", &self.max_logs)
+            .field(
+                "max_logs",
+                &self.max_logs.load(std::sync::atomic::Ordering::Relaxed),
+            )
             .finish()
     }
 }
@@ -2233,15 +2533,32 @@ impl InMemoryLogStorage {
         let (tx, _) = broadcast::channel(1024);
         Self {
             logs: RwLock::new(VecDeque::with_capacity(max_logs)),
-            max_logs,
+            max_logs: std::sync::atomic::AtomicUsize::new(max_logs),
             tx,
+        }
+    }
+
+    /// Retune the capacity at runtime; a shrink evicts oldest logs.
+    pub fn set_max_logs(&self, max: usize) {
+        let max = max.max(1);
+        self.max_logs
+            .store(max, std::sync::atomic::Ordering::Relaxed);
+        let mut logs = self.logs.write().unwrap();
+        if logs.len() > max {
+            let excess = logs.len() - max;
+            logs.drain(..excess);
         }
     }
 
     pub fn store(&self, mut log: StoredLog) {
         strip_ansi_from_log(&mut log);
         let mut logs = self.logs.write().unwrap();
-        if logs.len() >= self.max_logs {
+        while logs.len()
+            >= self
+                .max_logs
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .max(1)
+        {
             logs.pop_front();
         }
         logs.push_back(log.clone());
@@ -2252,9 +2569,13 @@ impl InMemoryLogStorage {
 
     pub fn add_logs(&self, new_logs: Vec<StoredLog>) {
         let mut logs = self.logs.write().unwrap();
+        let max_logs = self
+            .max_logs
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .max(1);
         for mut log in new_logs {
             strip_ansi_from_log(&mut log);
-            if logs.len() >= self.max_logs {
+            while logs.len() >= max_logs {
                 logs.pop_front();
             }
             logs.push_back(log.clone());
@@ -2445,8 +2766,16 @@ pub fn get_log_storage() -> Option<Arc<InMemoryLogStorage>> {
     LOG_STORAGE.get().cloned()
 }
 
-/// Initialize the global log storage.
+/// Initialize the global log storage, or retune the capacity of an existing
+/// one when an explicit limit is supplied. `None` never resets a configured
+/// limit back to the default.
 pub fn init_log_storage(max_logs: Option<usize>) {
+    if let Some(existing) = LOG_STORAGE.get() {
+        if let Some(max) = max_logs {
+            existing.set_max_logs(max);
+        }
+        return;
+    }
     let storage = Arc::new(InMemoryLogStorage::new(
         max_logs.unwrap_or(DEFAULT_MEMORY_MAX_LOGS),
     ));
@@ -2597,7 +2926,7 @@ pub async fn ingest_otlp_logs(json_str: &str) -> anyhow::Result<()> {
     // disabled at config time. Otherwise a Node/Python SDK worker posting
     // logs would lazily revive the storage that `initialize()` deliberately
     // did not create.
-    if !logs_enabled(get_otel_config()) {
+    if !logs_enabled(get_otel_config().as_deref()) {
         return Ok(());
     }
 
@@ -2693,13 +3022,20 @@ const MIN_LOG_FLUSH_INTERVAL_MS: u64 = 100;
 /// Maximum flush interval for log export (1 hour)
 const MAX_LOG_FLUSH_INTERVAL_MS: u64 = 3_600_000;
 
-/// OTLP Logs Exporter - exports logs to OTLP collector via gRPC
+/// HTTP timeout for a single OTLP logs export request. Bounds `export_batch`
+/// so a stalled collector cannot park the exporter task indefinitely — the
+/// task's shutdown signal is only observed between awaits in the select loop,
+/// so an unbounded send would also defeat exporter teardown on config rebuild.
+const DEFAULT_LOG_EXPORT_TIMEOUT_SECS: u64 = 30;
+
+/// OTLP Logs Exporter - exports logs to an OTLP HTTP collector.
 pub struct OtlpLogsExporter {
     endpoint: String,
     service_name: String,
     service_version: String,
     batch_size: usize,
     flush_interval: Duration,
+    headers: HeaderMap,
 }
 
 impl OtlpLogsExporter {
@@ -2711,6 +3047,7 @@ impl OtlpLogsExporter {
             service_version,
             batch_size: DEFAULT_LOG_BATCH_SIZE,
             flush_interval: Duration::from_millis(DEFAULT_LOG_FLUSH_INTERVAL_MS),
+            headers: otlp_logs_headers_from_env(),
         }
     }
 
@@ -2870,7 +3207,9 @@ impl OtlpLogsExporter {
         let resource_logs = self.build_otlp_logs_request(logs);
 
         // Send via HTTP to the OTLP collector
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(DEFAULT_LOG_EXPORT_TIMEOUT_SECS))
+            .build()?;
 
         // OTLP HTTP endpoint for logs
         // Convert gRPC port 4317 to HTTP port 4318 if needed
@@ -2888,6 +3227,7 @@ impl OtlpLogsExporter {
 
         let response = client
             .post(&endpoint)
+            .headers(self.headers.clone())
             .header("Content-Type", "application/json")
             .json(&resource_logs)
             .send()
@@ -3006,7 +3346,84 @@ impl OtlpLogsExporter {
     }
 }
 
-/// Get the logs exporter type from config
+fn otlp_logs_headers_from_env() -> HeaderMap {
+    env::var("OTEL_EXPORTER_OTLP_LOGS_HEADERS")
+        .or_else(|_| env::var("OTEL_EXPORTER_OTLP_HEADERS"))
+        .ok()
+        .as_deref()
+        .map(parse_otlp_header_string)
+        .unwrap_or_default()
+}
+
+fn parse_otlp_header_string(headers: &str) -> HeaderMap {
+    let mut header_map = HeaderMap::new();
+
+    for pair in headers.split(',') {
+        let Some((name, value)) = pair.split_once('=') else {
+            tracing::warn!("Ignoring malformed OTLP header entry without '='");
+            continue;
+        };
+
+        let name = name.trim();
+        let value = value.trim();
+        if name.is_empty() {
+            tracing::warn!("Ignoring OTLP header entry with empty name");
+            continue;
+        }
+
+        let Ok(name) = HeaderName::from_bytes(name.as_bytes()) else {
+            tracing::warn!(header = name, "Ignoring invalid OTLP header name");
+            continue;
+        };
+        let Some(value) = percent_decode_header_value(value) else {
+            tracing::warn!(header = %name, "Ignoring OTLP header value with invalid percent encoding");
+            continue;
+        };
+        let Ok(value) = HeaderValue::from_bytes(&value) else {
+            tracing::warn!(header = %name, "Ignoring invalid OTLP header value");
+            continue;
+        };
+
+        header_map.insert(name, value);
+    }
+
+    header_map
+}
+
+fn percent_decode_header_value(value: &str) -> Option<Vec<u8>> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hi = bytes.get(i + 1).copied().and_then(hex_value)?;
+            let lo = bytes.get(i + 2).copied().and_then(hex_value)?;
+            decoded.push((hi << 4) | lo);
+            i += 3;
+        } else {
+            decoded.push(bytes[i]);
+            i += 1;
+        }
+    }
+
+    Some(decoded)
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Get the logs exporter type from config.
+#[deprecated(
+    since = "0.19.0",
+    note = "Resolve the exporter type from ObservabilityWorkerConfig directly; this helper is kept for backward compatibility"
+)]
 pub fn get_logs_exporter_type() -> LogsExporterType {
     get_otel_config()
         .and_then(|cfg| cfg.logs_exporter.clone())
@@ -3026,6 +3443,183 @@ pub fn get_logs_exporter_type() -> LogsExporterType {
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    #[test]
+    #[serial]
+    fn otlp_logs_headers_fallback_decodes_percent_encoded_values() {
+        temp_env::with_vars(
+            [
+                ("OTEL_EXPORTER_OTLP_LOGS_HEADERS", None::<&str>),
+                (
+                    "OTEL_EXPORTER_OTLP_HEADERS",
+                    Some("Authorization=Bearer%20token,x-honeycomb-team=test%2Fteam"),
+                ),
+            ],
+            || {
+                let headers = otlp_logs_headers_from_env();
+
+                assert_eq!(
+                    headers
+                        .get("authorization")
+                        .expect("authorization header")
+                        .to_str()
+                        .unwrap(),
+                    "Bearer token"
+                );
+                assert_eq!(
+                    headers
+                        .get("x-honeycomb-team")
+                        .expect("x-honeycomb-team header")
+                        .to_str()
+                        .unwrap(),
+                    "test/team"
+                );
+            },
+        );
+    }
+
+    // ── Coverage: runtime storage-limit retune + dynamic sampler swap ──────
+    // These exercise the hot-apply LIMITS tier mechanisms and the swappable
+    // sampler that `apply_config` drives.
+
+    #[test]
+    fn set_max_spans_shrinks_and_rebuilds_trace_index() {
+        let storage = InMemorySpanStorage::new(10);
+        storage.add_spans(vec![
+            make_stored_span("trace-a", "s1", "op1", 1_000_000_000, 2_000_000_000),
+            make_stored_span("trace-b", "s2", "op2", 3_000_000_000, 4_000_000_000),
+            make_stored_span("trace-a", "s3", "op3", 5_000_000_000, 6_000_000_000),
+            make_stored_span("trace-c", "s4", "op4", 7_000_000_000, 8_000_000_000),
+        ]);
+        assert_eq!(storage.len(), 4);
+
+        // Shrink to 2: the two oldest (s1=trace-a, s2=trace-b) are evicted and
+        // the trace-id index is rebuilt from the survivors (s3=trace-a,
+        // s4=trace-c).
+        storage.set_max_spans(2);
+        assert_eq!(storage.len(), 2);
+        assert_eq!(
+            storage.get_spans_by_trace_id("trace-a").len(),
+            1,
+            "only the surviving trace-a span should remain in the rebuilt index"
+        );
+        assert_eq!(
+            storage.get_spans_by_trace_id("trace-b").len(),
+            0,
+            "the evicted trace-b span must be gone from the index"
+        );
+        assert_eq!(storage.get_spans_by_trace_id("trace-c").len(), 1);
+
+        // A 0 request is clamped to at least 1 (never a zero-capacity store).
+        storage.set_max_spans(0);
+        assert_eq!(storage.len(), 1);
+    }
+
+    #[test]
+    fn set_max_logs_shrinks_to_new_capacity() {
+        let storage = InMemoryLogStorage::new(10);
+        for i in 0..5 {
+            storage.store(StoredLog {
+                timestamp_unix_nano: 1_704_067_200_000_000_000 + i * 1_000_000_000,
+                observed_timestamp_unix_nano: 1_704_067_200_000_000_000 + i * 1_000_000_000,
+                severity_number: 9,
+                severity_text: "INFO".to_string(),
+                body: format!("log {i}"),
+                attributes: HashMap::new(),
+                trace_id: None,
+                span_id: None,
+                resource: HashMap::new(),
+                service_name: "test".to_string(),
+                instrumentation_scope_name: None,
+                instrumentation_scope_version: None,
+            });
+        }
+        assert_eq!(storage.len(), 5);
+
+        storage.set_max_logs(2);
+        let logs = storage.get_logs();
+        assert_eq!(logs.len(), 2, "shrink must drop the oldest logs");
+        assert_eq!(logs[0].body, "log 3", "oldest survivor after shrink");
+        assert_eq!(logs[1].body, "log 4");
+    }
+
+    #[test]
+    fn dynamic_sampler_swap_changes_decision() {
+        use opentelemetry::trace::{SamplingDecision, SpanKind, TraceId};
+        use opentelemetry_sdk::trace::ShouldSample;
+
+        let sampler = DynamicSampler::new(Sampler::AlwaysOff);
+        let drop = sampler.should_sample(
+            None,
+            TraceId::from_bytes([1u8; 16]),
+            "op",
+            &SpanKind::Internal,
+            &[],
+            &[],
+        );
+        assert!(
+            matches!(drop.decision, SamplingDecision::Drop),
+            "AlwaysOff inner must drop"
+        );
+
+        // Hot-swap the inner sampler; the same handle observes the new policy.
+        sampler.swap(Sampler::AlwaysOn);
+        let keep = sampler.should_sample(
+            None,
+            TraceId::from_bytes([2u8; 16]),
+            "op",
+            &SpanKind::Internal,
+            &[],
+            &[],
+        );
+        assert!(
+            matches!(keep.decision, SamplingDecision::RecordAndSample),
+            "after swap to AlwaysOn the same sampler must record-and-sample"
+        );
+
+        // A clone shares the same inner Arc, so it sees swaps too.
+        let cloned = sampler.clone();
+        sampler.swap(Sampler::AlwaysOff);
+        let drop_again = cloned.should_sample(
+            None,
+            TraceId::from_bytes([3u8; 16]),
+            "op",
+            &SpanKind::Internal,
+            &[],
+            &[],
+        );
+        assert!(
+            matches!(drop_again.decision, SamplingDecision::Drop),
+            "a clone must observe the swap through the shared inner"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn init_log_storage_retunes_existing_store() {
+        // init_log_storage is create-or-retune: a second call with a tighter
+        // cap retunes the live store rather than allocating a new one.
+        init_log_storage(Some(3));
+        let storage = get_log_storage().expect("log storage created");
+        storage.clear();
+        for i in 0..6 {
+            storage.store(StoredLog {
+                timestamp_unix_nano: 1_704_067_200_000_000_000 + i * 1_000_000_000,
+                observed_timestamp_unix_nano: 1_704_067_200_000_000_000 + i * 1_000_000_000,
+                severity_number: 9,
+                severity_text: "INFO".to_string(),
+                body: format!("retune {i}"),
+                attributes: HashMap::new(),
+                trace_id: None,
+                span_id: None,
+                resource: HashMap::new(),
+                service_name: "test".to_string(),
+                instrumentation_scope_name: None,
+                instrumentation_scope_version: None,
+            });
+        }
+        assert_eq!(storage.len(), 3, "retuned cap must bound the live store");
+    }
 
     #[tokio::test]
     #[serial]
@@ -3772,6 +4366,69 @@ mod tests {
         // Note: Baggage may or may not be available depending on context state
         // This test primarily verifies the function doesn't panic and context is valid
         let _count = bag.len();
+    }
+
+    #[test]
+    fn with_function_id_baggage_overrides_key_and_preserves_others() {
+        use opentelemetry::baggage::BaggageExt;
+
+        let cx = extract_context(
+            None,
+            Some("iii.session.id=s-1,iii.message.id=m-1,iii.function.id=run::start"),
+        );
+        let updated = with_function_id_baggage(&cx, "turn::provisioning");
+        let bag = updated.baggage();
+
+        assert_eq!(
+            bag.get("iii.function.id").map(|v| v.as_str().to_string()),
+            Some("turn::provisioning".to_string()),
+            "function id must be rewritten to the target",
+        );
+        assert_eq!(
+            bag.get("iii.session.id").map(|v| v.as_str().to_string()),
+            Some("s-1".to_string()),
+            "other baggage entries must be preserved",
+        );
+        assert_eq!(
+            bag.get("iii.message.id").map(|v| v.as_str().to_string()),
+            Some("m-1".to_string()),
+        );
+        // No duplicate entry left behind for the rewritten key.
+        let fn_count = bag
+            .iter()
+            .filter(|(k, _)| k.as_str() == "iii.function.id")
+            .count();
+        assert_eq!(fn_count, 1, "exactly one iii.function.id entry");
+    }
+
+    #[test]
+    fn baggage_with_function_id_header_names_target() {
+        // Round-trips through the W3C header form (the queue-message path).
+        let header = baggage_with_function_id(
+            Some("iii.session.id=s-9,iii.function.id=turn::provisioning"),
+            "turn::assistant_streaming",
+        )
+        .expect("baggage header is always produced");
+
+        assert!(
+            header.contains("iii.function.id=turn::assistant_streaming"),
+            "header must name the target function, got: {header}",
+        );
+        assert!(
+            !header.contains("turn::provisioning"),
+            "enqueuer function id must not survive, got: {header}",
+        );
+        assert!(
+            header.contains("iii.session.id=s-9"),
+            "other baggage entries must be preserved, got: {header}",
+        );
+    }
+
+    #[test]
+    fn baggage_with_function_id_inserts_when_absent() {
+        let header = baggage_with_function_id(None, "session-tree::ensure")
+            .expect("baggage header is always produced");
+        assert!(header.contains("iii.function.id=session-tree::ensure"));
     }
 
     #[test]
@@ -4712,6 +5369,76 @@ mod tests {
         assert!(matches!(sd.status, opentelemetry::trace::Status::Ok));
         assert_eq!(sd.attributes.len(), 1);
         assert_eq!(sd.attributes[0].key.as_str(), "http.method");
+    }
+
+    #[test]
+    fn test_build_forward_resource_preserves_service_name() {
+        // DUP-3: a worker's OTLP resource (service.name=harness) must survive
+        // into the forwarder `Resource` so the collector attributes spans
+        // correctly instead of bucketing them under `unknown_service`.
+        let json_str = r#"{
+            "resourceSpans": [{
+                "resource": {
+                    "attributes": [
+                        {"key": "service.name", "value": {"stringValue": "harness"}},
+                        {"key": "service.version", "value": {"stringValue": "1.2.3"}}
+                    ]
+                },
+                "scopeSpans": []
+            }]
+        }"#;
+        let request: OtlpExportTraceServiceRequest =
+            serde_json::from_str(json_str).expect("parse JSON");
+        let rs = &request.resource_spans[0];
+
+        let resource = build_forward_resource(&rs.resource);
+        let svc = resource
+            .get(&opentelemetry::Key::from_static_str("service.name"))
+            .map(|v| v.as_str().to_string());
+        assert_eq!(svc.as_deref(), Some("harness"));
+        // The per-service forwarder is keyed by this same extraction.
+        assert_eq!(extract_service_name(&rs.resource), "harness");
+    }
+
+    #[test]
+    fn test_forward_span_sampling_respects_sampler() {
+        // VOL-3: forwarded worker spans must pass through the engine sampler
+        // rather than being exported unconditionally.
+        let json_str = r#"{
+            "resourceSpans": [{
+                "resource": {
+                    "attributes": [{
+                        "key": "service.name",
+                        "value": {"stringValue": "harness"}
+                    }]
+                },
+                "scopeSpans": [{
+                    "scope": {"name": "test-scope", "version": "1.0.0"},
+                    "spans": [{
+                        "traceId": "0af7651916cd43dd8448eb211c80319c",
+                        "spanId": "b7ad6b7169203331",
+                        "name": "sampled-span",
+                        "kind": 1,
+                        "startTimeUnixNano": "1704067200000000000",
+                        "endTimeUnixNano": "1704067201000000000",
+                        "status": {"code": 1, "message": ""}
+                    }]
+                }]
+            }]
+        }"#;
+        let request: OtlpExportTraceServiceRequest =
+            serde_json::from_str(json_str).expect("parse JSON");
+        let span_data = convert_otlp_to_span_data(&request);
+        let sd = &span_data[0];
+
+        assert!(
+            forward_span_is_sampled(&Sampler::AlwaysOn, sd),
+            "AlwaysOn must keep forwarded spans"
+        );
+        assert!(
+            !forward_span_is_sampled(&Sampler::AlwaysOff, sd),
+            "AlwaysOff must drop forwarded spans"
+        );
     }
 
     #[test]

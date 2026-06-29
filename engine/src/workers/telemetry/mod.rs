@@ -205,11 +205,33 @@ pub fn is_iii_builtin_function_id(id: &str) -> bool {
         || id.starts_with("stream::")
         || id.starts_with("configuration::")
         || id.starts_with("iii::")
+        || id.starts_with("iii-http::")
+        || id.starts_with("iii-state::")
+        || id.starts_with("iii-pubsub::")
+        || id.starts_with("iii-stream::")
+        || id.starts_with("iii-cron::")
+        || id.starts_with("iii-queue::")
+        || id.starts_with("iii-observability::")
         || id.starts_with("bridge.")
         || id.starts_with("motia::")
         || id == "publish"
         || id == "motia_step_get"
         || id.starts_with("steps::")
+}
+
+/// Whether OTEL spans should be emitted for built-in framework function
+/// invocations (`state::*`, `stream::*`, `engine::*`, …).
+///
+/// Defaults to `false`: built-in calls are high-frequency and low-value in
+/// traces, so suppressing them sharply reduces span volume. Set
+/// `III_OTEL_TRACE_BUILTINS=true` (or `1`) to emit them anyway.
+pub fn trace_builtins_enabled() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("III_OTEL_TRACE_BUILTINS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
 }
 
 fn check_disabled(config: &TelemetryConfig) -> Option<DisableReason> {
@@ -981,7 +1003,12 @@ impl Worker for TelemetryWorker {
     }
 }
 
-crate::register_worker!("iii-telemetry", TelemetryWorker, mandatory);
+crate::register_worker!(
+    "iii-telemetry",
+    TelemetryWorker,
+    description = "Anonymous usage telemetry and heartbeat reporting for the engine.",
+    mandatory
+);
 
 #[cfg(test)]
 mod tests {
@@ -2143,6 +2170,14 @@ mod tests {
         assert!(is_iii_builtin_function_id("publish"));
         assert!(is_iii_builtin_function_id("bridge.invoke"));
         assert!(is_iii_builtin_function_id("iii::queue::redrive"));
+        // Per-worker config-change handlers register under the worker-name
+        // prefix (not the short `state::`/`http::` namespace).
+        assert!(is_iii_builtin_function_id("iii-http::on-config-change"));
+        assert!(is_iii_builtin_function_id("iii-state::on-config-change"));
+        assert!(is_iii_builtin_function_id("iii-pubsub::on-config-change"));
+        assert!(is_iii_builtin_function_id("iii-stream::on-config-change"));
+        assert!(is_iii_builtin_function_id("iii-cron::on-config-change"));
+        assert!(is_iii_builtin_function_id("iii-queue::on-config-change"));
         assert!(!is_iii_builtin_function_id("orders::process"));
         assert!(!is_iii_builtin_function_id("user::my_function"));
         assert!(!is_iii_builtin_function_id("payments::charge"));

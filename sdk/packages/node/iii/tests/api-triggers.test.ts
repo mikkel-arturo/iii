@@ -2,9 +2,9 @@ import * as fs from 'node:fs'
 import * as path from 'node:path'
 import { pipeline } from 'node:stream/promises'
 import { fileURLToPath } from 'node:url'
-import { describe, expect, it } from 'vitest'
-import { http, type ApiResponse, type HttpRequest } from '../src'
-import type { HttpResponse } from '../src/types'
+import { describe, expect, it, vi } from 'vitest'
+import { http, type HttpRequest, type HttpResponse } from '@iii-dev/helpers/http'
+import type { StreamResponse } from '../src/types'
 import { engineHttpUrl, execute, httpRequest, iii, sleep } from './utils'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -14,7 +14,7 @@ describe('API Triggers', () => {
   it('should register GET endpoint', async () => {
     const fn = iii.registerFunction(
       'test.api.get',
-      async (_req: HttpRequest): Promise<ApiResponse> => ({
+      async (_req: HttpRequest): Promise<HttpResponse> => ({
         status_code: 200,
         body: { message: 'Hello from GET' },
       }),
@@ -43,7 +43,7 @@ describe('API Triggers', () => {
   it('should register POST endpoint with body', async () => {
     const fn = iii.registerFunction(
       'test.api.post',
-      async (req: HttpRequest): Promise<ApiResponse> => {
+      async (req: HttpRequest): Promise<HttpResponse> => {
         const body = (req.body as Record<string, unknown>) ?? {}
         return {
           status_code: 201,
@@ -78,7 +78,7 @@ describe('API Triggers', () => {
 
     const fn = iii.registerFunction(
       'test::api::json::raw',
-      http(async (req: HttpRequest, response: HttpResponse) => {
+      http(async (req: HttpRequest, response: StreamResponse) => {
         const rawBody = await req.request_body.readAll()
 
         response.status(200)
@@ -124,7 +124,7 @@ describe('API Triggers', () => {
   it('should handle path parameters', async () => {
     const fn = iii.registerFunction(
       'test.api.getById',
-      async (req: HttpRequest): Promise<ApiResponse> => ({
+      async (req: HttpRequest): Promise<HttpResponse> => ({
         status_code: 200,
         body: { id: req.path_params?.id },
       }),
@@ -153,7 +153,7 @@ describe('API Triggers', () => {
   it('should handle query parameters', async () => {
     const fn = iii.registerFunction(
       'test.api.search',
-      async (req: HttpRequest): Promise<ApiResponse> => {
+      async (req: HttpRequest): Promise<HttpResponse> => {
         const q = req.query_params?.q
         const limit = req.query_params?.limit
         const qVal = Array.isArray(q) ? q[0] : q
@@ -189,7 +189,7 @@ describe('API Triggers', () => {
   it('should return custom status code', async () => {
     const fn = iii.registerFunction(
       'test.api.notfound',
-      async (_req: HttpRequest): Promise<ApiResponse<404>> => ({
+      async (_req: HttpRequest): Promise<HttpResponse<404>> => ({
         status_code: 404,
         body: { error: 'Not found' },
       }),
@@ -215,11 +215,11 @@ describe('API Triggers', () => {
     trigger.unregister()
   })
 
-  it('should honor Content-Type header when returning ApiResponse with string body', async () => {
+  it('should honor Content-Type header when returning HttpResponse with string body', async () => {
     const xmlBody = '<?xml version="1.0" encoding="UTF-8"?><note><to>user</to><body>hello</body></note>'
     const fn = iii.registerFunction(
       'test.api.xml.return',
-      async (_req: HttpRequest): Promise<ApiResponse> => ({
+      async (_req: HttpRequest): Promise<HttpResponse> => ({
         status_code: 200,
         headers: { 'Content-Type': 'text/xml' },
         body: xmlBody,
@@ -250,7 +250,7 @@ describe('API Triggers', () => {
     const originalPdf = fs.readFileSync(pdfPath)
     const fn = iii.registerFunction(
       'test.api.download.pdf',
-      http(async (_req: HttpRequest, response: HttpResponse) => {
+      http(async (_req: HttpRequest, response: StreamResponse) => {
         const fileStream = fs.createReadStream(pdfPath)
 
         response.status(200)
@@ -290,7 +290,7 @@ describe('API Triggers', () => {
 
     const fn = iii.registerFunction(
       'test.api.upload.pdf',
-      http(async (req: HttpRequest, response: HttpResponse) => {
+      http(async (req: HttpRequest, response: StreamResponse) => {
         const chunks: Buffer[] = []
 
         response.status(200)
@@ -345,7 +345,7 @@ describe('API Triggers', () => {
 
     const fn = iii.registerFunction(
       'test.api.sse',
-      http(async (_req: HttpRequest, response: HttpResponse) => {
+      http(async (_req: HttpRequest, response: StreamResponse) => {
         response.status(200)
         response.headers({
           'content-type': 'text/event-stream',
@@ -419,7 +419,7 @@ describe('API Triggers', () => {
   it('should handle application/x-www-form-urlencoded request', async () => {
     const fn = iii.registerFunction(
       'test.api.form.urlencoded',
-      http(async (req: HttpRequest, response: HttpResponse) => {
+      http(async (req: HttpRequest, response: StreamResponse) => {
         const chunks: Buffer[] = []
 
         for await (const chunk of req.request_body.stream) {
@@ -482,7 +482,7 @@ describe('API Triggers', () => {
 
     const fn = iii.registerFunction(
       'test.api.form.multipart',
-      http(async (req: HttpRequest, response: HttpResponse) => {
+      http(async (req: HttpRequest, response: StreamResponse) => {
         const chunks: Buffer[] = []
 
         for await (const chunk of req.request_body.stream) {
@@ -547,5 +547,55 @@ describe('API Triggers', () => {
 
     fn.unregister()
     trigger.unregister()
+  })
+
+  it('should reject a conflicting route structure without crashing the engine', async () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    const handler = async (_req: HttpRequest): Promise<HttpResponse> => ({
+      status_code: 200,
+      body: { ok: true },
+    })
+
+    // First route registers normally.
+    const fnA = iii.registerFunction('test.api.conflict.a', handler)
+    const triggerA = iii.registerTrigger({
+      type: 'http',
+      function_id: fnA.id,
+      config: {
+        api_path: 'test/node/conflict/:listId/:userId',
+        http_method: 'GET',
+      },
+    })
+
+    // Second route has the same axum shape with swapped param names -> conflict.
+    const fnB = iii.registerFunction('test.api.conflict.b', handler)
+    const triggerB = iii.registerTrigger({
+      type: 'http',
+      function_id: fnB.id,
+      config: {
+        api_path: 'test/node/conflict/:userId/:listId',
+        http_method: 'GET',
+      },
+    })
+
+    await sleep(500)
+
+    // Engine stayed alive and the first route still serves — no panic.
+    const response = await execute(async () =>
+      httpRequest('GET', '/test/node/conflict/list1/user1'),
+    )
+    expect(response.status).toBe(200)
+    expect(response.data).toEqual({ ok: true })
+
+    // The conflicting registration was surfaced as an error.
+    const formatted = errorSpy.mock.calls.map((args) => args.join(' ')).join('\n')
+    expect(formatted.toLowerCase()).toContain('conflict')
+    errorSpy.mockRestore()
+
+    fnA.unregister()
+    triggerA.unregister()
+    fnB.unregister()
+    triggerB.unregister()
   })
 })

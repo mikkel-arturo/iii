@@ -3,7 +3,7 @@
 //
 // Closes iii-hq/iii#1546. Each test here exercises behavior that
 // requires going through `BuiltinKvStore` (persistence across calls,
-// op-batch interleaving, error plumbing into `UpdateResult`). The
+// op-batch interleaving, error plumbing into `StreamUpdateResult`). The
 // in-batch nested-merge mechanics — auto-create intermediates, replace
 // non-object intermediates, validation rejections — are covered by
 // the unit tests in `engine/src/update_ops.rs`.
@@ -11,7 +11,7 @@
 use serde_json::json;
 
 use iii::builtins::kv::BuiltinKvStore;
-use iii_sdk::{UpdateOp, UpdateOpError, types::MergePath};
+use iii_helpers::stream::{MergePath, UpdateOp, UpdateOpError};
 
 const SCOPE: &str = "audio::transcripts";
 
@@ -19,7 +19,7 @@ async fn fresh_store() -> BuiltinKvStore {
     BuiltinKvStore::new(None)
 }
 
-fn set_op(path: impl Into<iii_sdk::FieldPath>, value: serde_json::Value) -> UpdateOp {
+fn set_op(path: impl Into<String>, value: serde_json::Value) -> UpdateOp {
     UpdateOp::Set {
         path: path.into(),
         value: Some(value),
@@ -653,7 +653,7 @@ async fn append_root_when_state_is_empty_array_pushes_value() {
             SCOPE.to_string(),
             key.clone(),
             vec![UpdateOp::Set {
-                path: iii_sdk::FieldPath::from(""),
+                path: String::new(),
                 value: Some(json!([])),
             }],
         )

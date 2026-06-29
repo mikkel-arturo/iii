@@ -33,7 +33,7 @@ by default and uses itself.
 it to an in-memory store instead. Find the `iii-state` entry in `config.yaml` and set its
 `store_method`:
 
-```yaml config.yaml
+```yaml {8-9} config.yaml
 workers:
   # ...
   - name: iii-state
@@ -42,10 +42,11 @@ workers:
         name: kv
         config:
           store_method: in_memory
+#         file_path: ./data/state_store.db
 ```
 
-Now restarting the engine clears every link. That's fine here;
-[Ch. 3: Persist everything](/tutorials/linkly/persistence) swaps in durable storage.
+Since we're using an in-memory store every restart will clear the data we're storing. That's fine
+here; [Ch. 3: Persist everything](/tutorials/linkly/persistence) swaps in durable storage.
 
 You may also notice a iii.lock file: that's how iii tracks worker dependencies and versions so that
 iii deployments are repeatable. This is similar to lock files in other package managers.
@@ -67,23 +68,26 @@ A worker is a self-contained service. Here, the `link` worker is a Node package 
 language or runtime.
 
 `link/iii.worker.yaml` is the manifest that describes how the worker builds and runs itself: the
-command to install dependencies and the command to start. Update it so it looks like the below.
+command to install dependencies and the command to start. The default manifest will work for our
+purposes.
 
-```yaml {6-8} iii.worker.yaml
+```yaml iii.worker.yaml
 name: link
 runtime:
-  kind: typescript
-  package_manager: npm
-  entry: src/index.ts
+  base_image: docker.io/iiidev/node:latest
 scripts:
-  install: "npm install"
-  start: "npm run start"
+  install: npm install
+  start: npm run start
 ```
 
 <Info>
-  iii runs a worker for you from these `scripts`, but a worker is an ordinary service: you can also
-  start it yourself and let it connect to the engine over WebSocket. Learn more about the
-  [`iii.worker.yaml` manifest](/creating-workers/workers#worker-manifest).
+  iii runs an isolated sandboxed worker for you from these `scripts`, but a worker can also be an
+  ordinary service. Any process that uses a iii SDK and calls `registerWorker()` is also a worker.
+  This means you can run the worker directly with `npm i && npm start` and it behaves the same as
+  the `iii worker` variant, only outside of a sandbox.
+  <p>
+    Learn more about the [`iii.worker.yaml` manifest](/creating-workers/workers#worker-manifest).
+  </p>
 </Info>
 
 Replace the template's `link/package.json` with this one. Note you don't need to run npm or node
@@ -101,10 +105,11 @@ directly and reloads the worker whenever you save a change.
     "start": "tsx watch src/index.ts"
   },
   "dependencies": {
-    "iii-sdk": ">=0.17.0"
+    "iii-sdk": "0.20.0",
+    "@iii-dev/helpers": "0.20.0",
+    "tsx": "^4.22.3"
   },
   "devDependencies": {
-    "tsx": "^4.22.3",
     "typescript": "^5.9.3",
     "@types/node": "^24.10.1"
   }
@@ -127,7 +132,8 @@ pasting one large file at once.
 `index.ts` with the connection setup and a small helper that generates random short codes:
 
 ```typescript src/index.ts
-import { registerWorker, Logger } from "iii-sdk";
+import { registerWorker } from "iii-sdk";
+import { Logger } from "@iii-dev/helpers/observability";
 
 const worker = registerWorker(process.env.III_URL ?? "ws://localhost:49134", {
   workerName: "link",
@@ -176,6 +182,7 @@ worker.registerFunction("link::resolve", async (payload: { code: string }) => {
     function_id: "state::get",
     payload: { scope: "links", key: payload.code },
   });
+  logger.info("link resolved", { code: payload.code, found: !!stored?.url });
   return { url: stored?.url ?? null };
 });
 
@@ -204,11 +211,19 @@ Add the `link` worker to your system by running:
 iii worker add ./link
 ```
 
-<Note>
-  You do not run the worker yourself: iii runs the worker's `install` script the first time it
-  starts the worker. You will see the `link` worker register `link::create` and `link::resolve`.
-  Leave the engine running and open a second terminal for the next steps.
-</Note>
+iii runs the worker's `install` script the first time it starts the worker. On the `iii` engine's
+output you will see the `link` worker register `link::create` and `link::resolve`. The output will
+look something like this:
+
+```bash
+[11:54:47.597 AM] [INFO] iii::worker_connections Worker registered
+    ├ worker_id: adf46954-461e-450c-961f-ed6fe0cc1e31
+    └ ip_address: Some("127.0.0.1")
+[11:54:47.609 AM] [INFO] iii::function [REGISTERED] Function link::create
+[11:54:47.609 AM] [INFO] iii::function [REGISTERED] Function link::resolve
+[11:54:47.697 AM] [INFO] iii-node link worker ready
+```
+
 ## Call the functions
 
 `iii trigger` invokes a function on the running engine. Create a link with a custom code:
